@@ -1,0 +1,237 @@
+services:
+  database:
+    build:
+      context: ./database
+    image: ${COMPOSE_PROJECT_NAME:-test-project}-database:latest
+    # Only its own credentials, never all of .env: each service holds just the secrets it needs.
+    environment:
+      POSTGRES_DB: ${TEST_PROJECT__DB__NAME}
+      POSTGRES_USER: ${TEST_PROJECT__DB__USER}
+      POSTGRES_PASSWORD: ${TEST_PROJECT__DB__PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${TEST_PROJECT__DB__USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  broker:
+    build:
+      context: ./broker
+    image: ${COMPOSE_PROJECT_NAME:-test-project}-broker:latest
+    environment:
+      RABBITMQ_DEFAULT_USER: ${TEST_PROJECT__BROKER__USER}
+      RABBITMQ_DEFAULT_PASS: ${TEST_PROJECT__BROKER__PASSWORD}
+    networks:
+      - internal
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "rabbitmqctl", "status"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  # S3-compatible object storage for local dev and demos. Pinned to the last release that starts
+  # without a LocalStack account and auth token - every release from 2026.03.0 on requires one.
+  # No docker.sock and no Lambda port range: only S3 runs. Community edition keeps nothing across a
+  # restart, so the init hook below recreates the bucket on every start.
+  storage:
+    image: localstack/localstack:4.14.0
+    environment:
+      SERVICES: s3
+      # Read by the init hook, which creates the bucket - the app never does.
+      BUCKET_NAME: ${TEST_PROJECT__STORAGE__BUCKET_NAME}
+      REGION_NAME: ${TEST_PROJECT__STORAGE__REGION_NAME}
+    volumes:
+      - ./localstack/init:/etc/localstack/init
+    networks:
+      - internal
+      # Only so the port below can be published at all - Docker publishes nothing for a container
+      # whose every network is `internal`.
+      - external
+    ports:
+      # Loopback only, for poking at it by hand (`aws --endpoint-url=http://localhost:4566 s3 ls`);
+      # the backend reaches it as storage:4566.
+      - "127.0.0.1:${TEST_PROJECT__STORAGE__PORT:-4566}:4566"
+    restart: unless-stopped
+    healthcheck:
+      # The bucket rather than the service, so a backend never starts against one not made yet.
+      test: ["CMD-SHELL", "awslocal s3api head-bucket --bucket \"$$BUCKET_NAME\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./test_project
+      dockerfile: Dockerfile
+    image: ${COMPOSE_PROJECT_NAME:-test-project}-backend:latest
+    env_file: .env
+    volumes:
+      - ./test_project:/test_project
+    networks:
+      internal:
+        # nginx's named upstream (server/template.nginx.conf) targets this, not the bare
+        # "backend" service name - a container on more than one network answers to its bare name
+        # on *either* one, which leaves DNS free to hand back whichever address resolved first
+        # instead of reliably this network's.
+        aliases:
+          - backend-internal
+      external:
+    depends_on:
+      database:
+        condition: service_healthy
+      broker:
+        condition: service_healthy
+      # A real dependency, not a nice-to-have: an upload is a synchronous call from the request.
+      storage:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health/"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    image: ${COMPOSE_PROJECT_NAME:-test-project}-backend:latest
+    command: celery -A test_project worker
+    env_file: .env
+    volumes:
+      - ./test_project:/test_project
+    networks:
+      - internal
+      - external
+    depends_on:
+      database:
+        condition: service_healthy
+      broker:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  scheduler:
+    image: ${COMPOSE_PROJECT_NAME:-test-project}-backend:latest
+    command: celery -A test_project beat --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    env_file: .env
+    volumes:
+      - ./test_project:/test_project
+    networks:
+      - internal
+      - external
+    depends_on:
+      database:
+        condition: service_healthy
+      broker:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # The frontend suites in the image the app is built in, the same way CI runs them. Profiled, so
+  # `docker compose up` never starts it: `docker compose run --rm frontend-test`.
+  frontend-test:
+    build:
+      context: ./test_project-frontend
+      dockerfile: apps/web/Dockerfile
+      target: tester
+    image: ${COMPOSE_PROJECT_NAME:-test-project}-frontend-test:latest
+    profiles: ["test"]
+    working_dir: /repo
+    volumes:
+      # Sources live, so a run needs no rebuild - but never the installed trees, which belong to the
+      # image and are resolved for its platform.
+      - ./test_project-frontend:/repo
+      - /repo/node_modules
+      - /repo/apps/web/node_modules
+      - /repo/packages/api/node_modules
+      - /repo/packages/auth-api/node_modules
+
+  frontend:
+    build:
+      context: ./test_project-frontend
+      dockerfile: apps/web/Dockerfile
+      args:
+        # Build-time by necessity - next build inlines it into the client bundle. Every other
+        # frontend value is read at runtime from the environment below.
+        NEXT_PUBLIC_SENTRY_DSN: ${NEXT_PUBLIC_SENTRY_DSN:-}
+    image: ${COMPOSE_PROJECT_NAME:-test-project}-frontend:latest
+    # Named one by one rather than all of .env: this is the public-facing process, and none of the
+    # backend's secrets belong in it.
+    environment:
+      TEST_PROJECT__DOMAIN: ${TEST_PROJECT__DOMAIN}
+      TEST_PROJECT_SERVER__SENTRY__DSN: ${TEST_PROJECT_SERVER__SENTRY__DSN:-}
+      # Set in .env by scripts/dev-tls.sh, local dev only.
+      NODE_EXTRA_CA_CERTS: ${NODE_EXTRA_CA_CERTS:-}
+      # Node's http.Server default (5000ms) is shorter than nginx's upstream keepalive_timeout
+      # to this container (server/template.nginx.conf) - nginx would keep reusing a connection
+      # this server had already dropped, reproducing the exact uwsgi keep-alive bug one hop over.
+      # Must stay longer than every upstream keepalive_timeout pointed at this container.
+      KEEP_ALIVE_TIMEOUT: 65000
+    networks:
+      internal:
+        aliases:
+          - frontend-internal
+      external:
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      # Not "/" - that renders the root layout, which calls getSession() and reaches out to the
+      # backend; manifest.webmanifest is a plain route handler, unaffected, and already fast.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/manifest.webmanifest"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # The only service publishing a host port. Unlike a dynamic multi-tenant setup, this domain is
+  # fixed and known at generation time, so nginx routes by a small, explicit set of server_name
+  # blocks (see server/template.nginx.conf) rather than anything wildcard/dynamic.
+  server:
+    build:
+      context: ./test_project-server
+    image: ${COMPOSE_PROJECT_NAME:-test-project}-server:latest
+    # The one value the nginx template is rendered with (entrypoint.sh substitutes every variable it
+    # holds), and no secret.
+    environment:
+      TEST_PROJECT__DOMAIN: ${TEST_PROJECT__DOMAIN}
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    ports:
+      # Loopback unless HTTP_BIND says otherwise: an off-host load balancer needs the host's private address.
+      - "${TEST_PROJECT__HTTP_BIND:-127.0.0.1}:${TEST_PROJECT__HTTP_PORT:-80}:80"
+    networks:
+      internal:
+        # The frontend's own SSR fetches resolve these the same way a browser's requests do -
+        # straight to backend (as they did before) would let SSR silently take a different path
+        # through the stack than the browser, which is exactly what let a keep-alive mismatch
+        # between nginx and uwsgi go unnoticed: nginx's access log never saw that traffic, and
+        # every fix aimed at nginx accordingly missed the hop that mattered.
+        aliases:
+          - api.${TEST_PROJECT__DOMAIN}
+          - admin.${TEST_PROJECT__DOMAIN}
+          - auth.${TEST_PROJECT__DOMAIN}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
+
+networks:
+  internal:
+    internal: true
+  external:
+    driver: bridge

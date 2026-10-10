@@ -1,0 +1,184 @@
+{
+  "app/(authenticated)/home.tsx": [
+    {
+      "mutator": "ConditionalExpression",
+      "fingerprint": "12621c2415f7",
+      "reason": [
+        "Equivalent mutant either way, both the guard and the deps array - see lib/useAuthenticated.ts's own",
+        "copy of this same effect for why."
+      ]
+    },
+    {
+      "mutator": "ArrayDeclaration",
+      "fingerprint": "1cf406907db3",
+      "reason": [
+        "Equivalent mutant either way, both the guard and the deps array - see lib/useAuthenticated.ts's own",
+        "copy of this same effect for why."
+      ]
+    }
+  ],
+  "app/(authenticated)/profile/connections.tsx": [
+    {
+      "mutator": "ConditionalExpression",
+      "fingerprint": "3884f5a472ad",
+      "reason": [
+        "Equivalent mutant either way, both the guard and the deps array - see lib/useAuthenticated.ts's own",
+        "copy of this same effect for why."
+      ]
+    },
+    {
+      "mutator": "ArrayDeclaration",
+      "fingerprint": "1cf406907db3",
+      "reason": [
+        "Equivalent mutant either way, both the guard and the deps array - see lib/useAuthenticated.ts's own",
+        "copy of this same effect for why."
+      ]
+    }
+  ],
+  "app/(authenticated)/profile/details.tsx": [
+    {
+      "mutator": "ArrayDeclaration",
+      "fingerprint": "1cf406907db3",
+      "reason": [
+        "Equivalent mutant either way, both the guard and the deps array - see lib/useAuthenticated.ts's own",
+        "copy of this same effect for why."
+      ]
+    },
+    {
+      "mutator": "ConditionalExpression",
+      "fingerprint": "a111beb68b9a",
+      "reason": [
+        "Equivalent mutant either way, both the guard and the deps array - see lib/useAuthenticated.ts's own",
+        "copy of this same effect for why."
+      ]
+    }
+  ],
+  "app/(authenticated)/profile/emails.tsx": [
+    {
+      "mutator": "ConditionalExpression",
+      "fingerprint": "3a25840eb0b5",
+      "reason": [
+        "Equivalent mutant either way, both the guard and the deps array - see lib/useAuthenticated.ts's own",
+        "copy of this same effect for why."
+      ]
+    },
+    {
+      "mutator": "ArrayDeclaration",
+      "fingerprint": "1cf406907db3",
+      "reason": [
+        "Equivalent mutant either way, both the guard and the deps array - see lib/useAuthenticated.ts's own",
+        "copy of this same effect for why."
+      ]
+    }
+  ],
+  "app/(authenticated)/profile/sessions.tsx": [
+    {
+      "mutator": "ConditionalExpression",
+      "fingerprint": "dbc3311bb9bc",
+      "reason": [
+        "Equivalent mutant either way, both the guard and the deps array - see lib/useAuthenticated.ts's own",
+        "copy of this same effect for why."
+      ]
+    },
+    {
+      "mutator": "ArrayDeclaration",
+      "fingerprint": "1cf406907db3",
+      "reason": [
+        "Equivalent mutant either way, both the guard and the deps array - see lib/useAuthenticated.ts's own",
+        "copy of this same effect for why."
+      ]
+    }
+  ],
+  "app/complete-signup.tsx": [
+    {
+      "mutator": "StringLiteral",
+      "fingerprint": "4c208b158cb0",
+      "reason": [
+        "Equivalent mutant: the form (the only place this renders) doesn't show until email is also set, and",
+        "both are always set together in the same effect below - so this initial value is never actually the",
+        "one a test could observe rendered."
+      ]
+    },
+    {
+      "mutator": "ArrayDeclaration",
+      "fingerprint": "fe46519c184b",
+      "reason": [
+        "Equivalent mutant: a fresh array literal with the same fixed content on every render compares equal",
+        "element-wise (see @isikk/core/hooks' own useIsMounted for this reasoning), so this effect's deps",
+        "array never actually causes an extra rerun either way."
+      ]
+    }
+  ],
+  "components/SocialLoginButtons.tsx": [
+    {
+      "mutator": "ConditionalExpression",
+      "fingerprint": "7f04d3acfe0f",
+      "reason": [
+        "Equivalent mutant: with both flags false, skipping this early return still renders an empty fragment",
+        "(both conditions below are false too) - indistinguishable from null in the tree either way, so no",
+        "assertion could tell the two apart."
+      ]
+    }
+  ],
+  "lib/i18n.ts": [
+    {
+      "mutator": "StringLiteral",
+      "fingerprint": "b57faf005ce4",
+      "reason": [
+        "equivalent mutant, the same way and for the same reason as the fallbackLng entry below - i18next",
+        "resolves an unknown lng through fallbackLng regardless of what this placeholder actually is, landing",
+        "on \"en\" either way."
+      ]
+    },
+    {
+      "mutator": "StringLiteral",
+      "fingerprint": "b5c23a94532c",
+      "reason": [
+        "equivalent mutant. deviceLanguage() only ever returns a language this app actually bundles resources",
+        "for, so a missing *key* inside that bundle is the only thing fallbackLng could ever catch here - and",
+        "every key that exists in \"en\" exists in every other bundle too (blank until translated, never absent",
+        "- see hooks/post_gen_project.py), so that never happens either."
+      ]
+    }
+  ],
+  "lib/useAuthenticated.ts": [
+    {
+      "mutator": "ConditionalExpression",
+      "fingerprint": "bb64640fd47f",
+      "reason": [
+        "isMounted is referentially stable (its own useCallback never changes it), so this effect's deps",
+        "array is equivalent to [] either way - and see @isikk/core/hooks' own useIsMounted for why the guard",
+        "below is equivalent too."
+      ]
+    },
+    {
+      "mutator": "ArrayDeclaration",
+      "fingerprint": "1cf406907db3",
+      "reason": [
+        "isMounted is referentially stable (its own useCallback never changes it), so this effect's deps",
+        "array is equivalent to [] either way - and see @isikk/core/hooks' own useIsMounted for why the guard",
+        "below is equivalent too."
+      ]
+    }
+  ],
+  "app/(authenticated)/prove.tsx": [
+    {
+      "mutator": "ConditionalExpression",
+      "fingerprint": "cd435c241ba0",
+      "reason": [
+        "isMounted is referentially stable (its own useCallback never changes it), so this effect's deps",
+        "array is equivalent to [] either way - and see @isikk/core/hooks' own useIsMounted for why the guard",
+        "below is equivalent too."
+      ]
+    },
+    {
+      "mutator": "ArrayDeclaration",
+      "fingerprint": "1cf406907db3",
+      "reason": [
+        "isMounted is referentially stable (its own useCallback never changes it), so this effect's deps",
+        "array is equivalent to [] either way - and see @isikk/core/hooks' own useIsMounted for why the guard",
+        "below is equivalent too."
+      ]
+    }
+  ]
+}

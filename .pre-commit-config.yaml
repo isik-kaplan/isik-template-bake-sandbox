@@ -1,0 +1,62 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-yaml
+        # Authentik blueprints use its own !Find/!KeyOf tags, which no plain YAML loader can
+        # construct. Excluded rather than passing --unsafe, which would weaken every other file.
+        exclude: ^e2e/authentik-blueprints/
+      - id: check-added-large-files
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.0
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  # The scripts rather than inline entries: migration-check and openapi-check pick between `exec`
+  # and `run` depending on whether the stack is up, lint-frontend has to change directory first. None
+  # takes paths, so `files` only decides whether they run at all.
+  - repo: local
+    hooks:
+      - id: migration-check
+        name: migration-check
+        entry: scripts/pre-commit/migration_check.sh
+        language: script
+        pass_filenames: false
+        files: ^test_project/.*\.py$
+
+      # Needs the backend image for the documents and the frontend's node_modules for the client.
+      - id: openapi-check
+        name: openapi-check
+        entry: scripts/pre-commit/openapi_check.sh
+        language: script
+        pass_filenames: false
+        files: ^test_project(/.*\.py|-frontend/packages/(api|auth-api)/.*)$
+
+      # Standard library only, so it runs straight off the checkout - no container, and no reason to
+      # skip it in the fast CI job.
+      - id: layout-check
+        name: layout-check
+        entry: python test_project/scripts/layout_check.py
+        language: python
+        pass_filenames: false
+        files: ^test_project/.*\.py$
+
+      # TERMS_VERSION is what a signup records, so it may never lag the documents it names.
+      - id: legal-version
+        name: legal-version
+        entry: python scripts/pre-commit/legal_version.py
+        language: python
+        pass_filenames: false
+        files: ^(test_project-frontend/apps/web/src/legal/|test_project/apps/users/terms\.py$)
+
+      - id: lint-frontend
+        name: lint-frontend
+        entry: scripts/pre-commit/lint_frontend.sh
+        language: script
+        pass_filenames: false
+        files: ^test_project-frontend/.*\.(ts|tsx|js|jsx|mjs|css|json|md)$

@@ -1,0 +1,505 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # The lint-frontend hook shells out to the real eslint/tsc/prettier, so its dependencies have
+      # to be here - and build:packages, since apps/web resolves the generated API clients by name
+      # through their dist/, which is not tracked.
+      - name: Install frontend dependencies
+        working-directory: test_project-frontend
+        run: npm ci
+      - name: Build the API client packages
+        working-directory: test_project-frontend
+        run: npm run build:packages
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: Install pre-commit
+        run: pipx install pre-commit
+
+      # migration-check and openapi-check are skipped here and run in the backend and schema jobs
+      # instead: both need compose, and this job is deliberately the fast one.
+      - name: Run pre-commit
+        env:
+          SKIP: migration-check,openapi-check
+        run: pre-commit run --all-files --show-diff-on-failure
+
+  # The openapi-check hook again, since a hook can be skipped locally: neither document may emit a
+  # generator warning, and the committed clients have to match what those documents say.
+  schema:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cp .env.example .env
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install frontend dependencies
+        working-directory: test_project-frontend
+        run: npm ci
+      - name: Build backend image
+        run: docker compose build backend
+      - name: Check the documents and the clients generated from them
+        run: scripts/pre-commit/openapi_check.sh
+
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # .env is gitignored (a developer's own copy, made locally by post_gen_project.py at
+      # generation time) - .env.example carries the same real, working values (see its own header
+      # comment), so a fresh checkout just needs the same copy repeated here.
+      - run: cp .env.example .env
+      - name: Build backend image
+        run: docker compose build backend
+      # storage too: the suite writes to real LocalStack, and --no-deps below starts nothing itself.
+      - name: Start database and storage
+        run: docker compose up -d --wait --wait-timeout 90 database storage
+      - name: Migrate
+        run: docker compose run --rm --no-deps backend python manage.py migrate
+      - name: Check for missing migrations
+        run: scripts/pre-commit/migration_check.sh
+      # With DEBUG off, as in production, so a new deployment warning fails the build rather than
+      # waiting to be noticed. The ones the project accepts are silenced, with reasons, in settings.py.
+      - name: Check the production settings
+        run: >-
+          docker compose run --rm --no-deps -e TEST_PROJECT__DEBUG=false backend
+          python manage.py check --deploy --fail-level WARNING
+
+      # Every xdist worker migrates its own test database otherwise, which is most of what a run
+      # costs. Keyed on what the schema is built from; a key that missed something is refused by the
+      # drift check in conftest.py rather than quietly measured against the wrong schema. Dumped and
+      # restored inside the database container, whose pg_dump matches the server's version.
+      - name: Name the template database
+        run: |
+          template=$(docker compose run --rm --no-deps -T backend \
+            python scripts/mutation_template.py name | tail -n 1 | tr -d '\r')
+          test -n "$template" || { echo "the template name came back empty"; exit 1; }
+          echo "MUTMUT_DB_TEMPLATE=$template" >> "$GITHUB_ENV"
+      - name: Restore the template database dump
+        id: template
+        uses: actions/cache@v4
+        with:
+          path: test_project/template.dump
+          key: >-
+            db-template-${{ hashFiles('test_project/apps/*/migrations/*.py',
+            'test_project/uv.lock') }}
+      - name: Build and dump the template database when the cache had none
+        if: steps.template.outputs.cache-hit != 'true'
+        run: |
+          docker compose run --rm --no-deps backend python scripts/mutation_template.py build
+          docker compose exec -T -e TEMPLATE="$MUTMUT_DB_TEMPLATE" database \
+            sh -c 'pg_dump -U "$POSTGRES_USER" -Fc -f /tmp/template.dump "$TEMPLATE"'
+          docker compose cp database:/tmp/template.dump test_project/template.dump
+      # From template0: the image's default template already carries the extension schemas the dump
+      # recreates, and a restore into a copy of it stops at the first "already exists".
+      - name: Load the template database
+        if: steps.template.outputs.cache-hit == 'true'
+        run: |
+          docker compose cp test_project/template.dump database:/tmp/template.dump
+          docker compose exec -T -e TEMPLATE="$MUTMUT_DB_TEMPLATE" database sh -c '
+            psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 \
+              -c "DROP DATABASE IF EXISTS \"$TEMPLATE\" WITH (FORCE)" \
+              -c "CREATE DATABASE \"$TEMPLATE\" TEMPLATE template0" &&
+            pg_restore -U "$POSTGRES_USER" -d "$TEMPLATE" --exit-on-error /tmp/template.dump'
+      - name: Test (100% coverage required)
+        run: docker compose run --rm --no-deps -e MUTMUT_DB_TEMPLATE backend python -m pytest
+      - if: always()
+        run: docker compose down -v
+
+  # Its own job rather than a step in `backend`: it reruns the suite once per mutant, so it runs in
+  # minutes against the unit suite's seconds. mutmut itself exits 0 regardless of survivors -
+  # check_mutants.py is what actually fails the build on one, unless it is an explained entry in
+  # mutation-equivalents.toml (one mutant) or mutation-exemptions.toml (a whole untraceable function).
+  #
+  # One job testing every mutant, not a shard matrix: a shard's own CI-matrix startup cost only pays
+  # for itself once a cold run is measured in tens of minutes, and this suite is not. If a future
+  # app makes it one, shard by file (mutmut's `only_mutate`) and give every shard the whole suite -
+  # a mutant killed by any test still counts, so shard by test would silently under-count kills.
+  backend-mutation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cp .env.example .env
+      - name: Build backend image
+        run: docker compose build backend
+      # storage too: the suite writes to real LocalStack, and --no-deps below starts nothing itself.
+      - name: Start database and storage
+        run: docker compose up -d --wait --wait-timeout 90 database storage
+      - name: Migrate
+        run: docker compose run --rm --no-deps backend python manage.py migrate
+      # Before the tree is built: also_copy brings locale/ into it, and without compiled catalogs the
+      # tree serves the default language whatever is active, so a translated mutant is unmeasurable.
+      - name: Compile the locale catalogs
+        run: docker compose run --rm --no-deps backend python manage.py compilemessages -i .venv -i mutants
+      # Cheap, and before anything runs: an entry for a mutant nothing generates any more excuses
+      # nothing, and the phases below only notice entries the tree still holds.
+      - name: Check every registry entry names a mutant that still exists
+        run: docker compose run --rm --no-deps backend python -m scripts.toolbox.check_exemption_keys
+
+      # Computed before anything below can touch [tool.mutmut] or the tooling files it covers, so a
+      # restore and the save at the end of this same run always hash the same inputs.
+      - name: Compute the mutation cache key
+        run: |
+          key=$(docker compose run --rm --no-deps -T backend \
+            python scripts/mutation_cache_key.py | tail -n 1 | tr -d '\r')
+          test -n "$key" || { echo "the cache key came back empty"; exit 1; }
+          echo "MUTMUT_CACHE_KEY=mutmut-$key" >> "$GITHUB_ENV"
+
+      # Restore and save are separate on purpose. The combined `actions/cache` writes nothing when
+      # the job fails, and a mutation run that goes red is exactly the one whose progress is most
+      # worth keeping - so saving below runs with `if: always()`.
+      - name: Restore the mutation cache
+        uses: actions/cache/restore@v4
+        with:
+          path: test_project/mutants
+          key: ${{ env.MUTMUT_CACHE_KEY }}-${{ github.sha }}
+          restore-keys: |
+            ${{ env.MUTMUT_CACHE_KEY }}-
+
+      # Migrations are most of a mutant's cost and every mutant pays it; cloning a database this
+      # builds once is a fraction of a second by comparison. `check` is not ceremony: a template that
+      # has drifted from what the migrations build measures every mutant against the wrong schema.
+      - name: Build the template database
+        run: docker compose run --rm backend python scripts/mutation_template.py build
+      - name: Check the template matches the migrations
+        run: docker compose run --rm backend python scripts/mutation_template.py check
+      - name: Name the template
+        run: |
+          template=$(docker compose run --rm --no-deps -T backend \
+            python scripts/mutation_template.py name | tail -n 1 | tr -d '\r')
+          test -n "$template" || { echo "the template name came back empty"; exit 1; }
+          echo "MUTMUT_DB_TEMPLATE=$template" >> "$GITHUB_ENV"
+
+      # The one clean pass, replacing the per-mutant one scripts/mutation_run.py otherwise answers by
+      # hashing the tree - hashing cannot see a test that passes against the source and fails inside
+      # the rewritten tree, so this runs the real suite in it once, before any mutant is selected.
+      # PY_IGNORE_IMPORTMISMATCH: pytest-django's own project auto-discovery re-adds this checkout's
+      # root to sys.path underneath mutants/, which only ever collides on the settings module (see
+      # scripts/mutation_run.py's own comment on it).
+      - name: Build the tree and run the suite in it once
+        run: |
+          docker compose run --rm --no-deps backend python scripts/mutation_run.py --build-tree
+          docker compose run --rm -w /test_project/mutants \
+            -e MUTMUT_DB_SUFFIX=cleanpass -e MUTMUT_DB_TEMPLATE=${{ env.MUTMUT_DB_TEMPLATE }} \
+            -e PY_IGNORE_IMPORTMISMATCH=1 backend python -m pytest --no-cov
+
+      # One child, always: parallel children would share one test database and fail over each other,
+      # which reads as a kill. Named rather than bare so the registries' mutants are
+      # skipped - each costs its whole traced set to prove what the file already says; the re-check
+      # step below settles them separately, without blocking the build on what it finds.
+      - name: Phase one
+        run: |
+          docker compose run --rm --no-deps backend python -m scripts.mutation_queue --run \
+            > test_project/queue.txt
+          wc -l < test_project/queue.txt
+          if [ ! -s test_project/queue.txt ]; then
+            echo "every mutant is exempt; phase one has nothing to run"; exit 0
+          fi
+          docker compose run --rm -e MUTMUT_DB_SUFFIX=phaseone \
+            -e MUTMUT_DB_TEMPLATE=${{ env.MUTMUT_DB_TEMPLATE }} backend \
+            sh -c 'xargs -d "\n" python scripts/mutation_run.py --max-children 1 < queue.txt'
+
+      # Before the config can be touched again: editing [tool.mutmut] changes mutmut's own
+      # fingerprint, after which every stored verdict reads as unchecked and the export is all zeros.
+      - name: Export the stats
+        if: always()
+        run: docker compose run --rm --no-deps backend python -m mutmut export-cicd-stats
+
+      # Mutants left alive here are candidates rather than verdicts, so this does not fail on them.
+      # What it does fail on is a stale tree or a run that tested nothing, both of which report as a
+      # pass otherwise.
+      - name: Check phase one ran
+        if: always()
+        run: docker compose run --rm --no-deps backend python -m scripts.check_mutants --phase-one
+
+      - name: Collect the unsettled ones
+        if: always()
+        run: |
+          # `|| true` because grep exits 1 when it matches nothing, and nothing to match is the best
+          # possible outcome here - every mutant settled in phase one.
+          # "no tests" too: a mutant tracing pointed no test at was never run, and a mutant nothing ran
+          # is a mutant nothing killed - left out, it would count as clean without being measured.
+          docker compose run --rm backend sh -c \
+            'python -m mutmut results | { grep -E ": (survived|timeout|not checked|no tests)$" || true; } \
+            | sed "s/^ *//"' > test_project/unsettled.txt
+          wc -l test_project/unsettled.txt
+
+      # Everything phase one's tracing got wrong is in this queue, settled against the whole suite in
+      # a fresh process per mutant - which also reaches code that only runs at import, before a
+      # mutant can be selected. --jobs 2 for a two-core runner, and no xdist: confirm_survivors.py
+      # refuses it, since one worker defeats pytest-django's ordering of transaction=True tests.
+      - name: Phase two
+        if: always()
+        run: |
+          docker compose run --rm -e MUTMUT_DB_TEMPLATE=${{ env.MUTMUT_DB_TEMPLATE }} backend \
+            python -m scripts.confirm_survivors --queue unsettled.txt --jobs 2
+
+      # The verdict. Fails on a mutant that survived the whole suite, on one that reached no verdict,
+      # and on one the report never mentions - a mutant phase two did not reach is absent rather than
+      # unsettled, so the queue is handed over too, or a partial report would read as a complete one.
+      #
+      # --summary writes inside the bind mount rather than straight to $GITHUB_STEP_SUMMARY: that path
+      # only exists on the runner, and this command runs inside the backend container, which never has
+      # it mounted - passing it through crashed the script before it reached its own verdict, which
+      # failed the job on every run regardless of how many mutants actually survived.
+      - name: Check phase two settled everything
+        if: always()
+        run: |
+          docker compose run --rm --no-deps backend python -m scripts.check_mutants \
+            --confirmed mutants/mutmut-confirmed.json --queue unsettled.txt --summary mutants/summary.md
+
+      # A question rather than a gate: where two case-only spellings of one literal got different
+      # verdicts, one of them is wrong, and which one is for whoever reads this.
+      - name: Ask whether two spellings of one literal agree
+        if: always()
+        continue-on-error: true
+        run: docker compose run --rm --no-deps backend python -m scripts.case_only_mutants
+
+      - name: Add the mutation table to the job summary
+        if: always()
+        run: cat test_project/mutants/summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      # Where the registries' claims get re-tested, since the phases above skipped them: one that now
+      # dies is an entry whose reasoning stopped being true. A prompt to revisit it, not a reason to
+      # hold a merge - so continue-on-error is deliberate. An equivalent entry with `verified_by` is
+      # left out: the test it names re-checks its reason in the suite on every push instead.
+      - name: Re-check the mutants the registry calls unkillable
+        if: always()
+        continue-on-error: true
+        run: |
+          docker compose run --rm --no-deps backend python -m scripts.mutation_queue --exempt \
+            > test_project/exempt.txt
+          if [ ! -s test_project/exempt.txt ]; then
+            echo "no exempt mutants"; exit 0
+          fi
+          wc -l < test_project/exempt.txt
+          docker compose run --rm -e MUTMUT_DB_SUFFIX=recheck \
+            -e MUTMUT_DB_TEMPLATE=${{ env.MUTMUT_DB_TEMPLATE }} backend \
+            sh -c 'xargs -d "\n" python scripts/mutation_run.py --max-children 1 < exempt.txt'
+          # A survivor (or mutmut's own "no tests") is the expected answer here; a kill is the finding.
+          killed=$(docker compose run --rm --no-deps backend sh -c \
+            'python -m mutmut results | grep -Ff exempt.txt | grep ": killed$" || true')
+          if [ -n "$killed" ]; then
+            echo "::warning::these exemptions are no longer true - a test now kills them:"
+            echo "$killed"
+            exit 1
+          fi
+          echo "every exemption still holds"
+
+      # The backend image has no USER, so mutmut/pytest wrote this directory as root - left alone,
+      # actions/cache/save can't tar files it doesn't have permission to read, and fails silently
+      # (continue-on-error below), leaving the cache never actually saved.
+      - name: Reclaim ownership of the mutation cache
+        if: always()
+        run: |
+          docker run --rm -v "$(pwd)/test_project/mutants:/x" alpine \
+            chown -R "$(id -u):$(id -g)" /x
+
+      - name: Save the mutation cache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: test_project/mutants
+          key: ${{ env.MUTMUT_CACHE_KEY }}-${{ github.sha }}
+
+      - if: always()
+        run: docker compose down -v
+
+  # In the Dockerfile's own `tester` image rather than on the runner, so the suites run on the same
+  # base, lockfile and platform-resolved node_modules the app is built with. Lint stays in the `lint`
+  # job's pre-commit run; the production build is the image's own `builder` stage, built by e2e.
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: test_project-frontend
+    steps:
+      - uses: actions/checkout@v4
+      # Plain docker build, not buildx: there is no cache to export, so the action costs more than it
+      # saves.
+      - name: Build the image the suites run in
+        run: docker build -f apps/web/Dockerfile --target tester -t test-project-frontend-test .
+      - name: Run the suites
+        run: docker run --rm test-project-frontend-test
+
+  # Read from the shard map rather than repeated here, so a shard added there is dispatched. A list
+  # kept in both places drifts silently: the map reports the files as covered and no job measures them.
+  frontend-mutation-shards:
+    runs-on: ubuntu-latest
+    outputs:
+      list: ${{ steps.read.outputs.list }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - id: read
+        working-directory: test_project-frontend/apps/web
+        run: echo "list=$(node scripts/mutation-shards.mjs --json)" >> "$GITHUB_OUTPUT"
+
+  # Its own jobs rather than a step in `frontend`: Stryker reruns the suite once per mutant. Sharded
+  # by what a file is for (see scripts/mutation-shards.mjs), so a red shard says where to look; every
+  # shard runs the whole suite and differs only in what it mutates. Stryker's own `thresholds.break`
+  # is null - check-mutants.mjs is the real gate, failing on any survivor not named in
+  # mutation-exemptions.json, and on any entry for this shard's files that no survivor matches.
+  # Inside the same tester image as `frontend`, so a shard mutates against the suite that job ran.
+  frontend-mutation:
+    needs: frontend-mutation-shards
+    name: frontend mutation (${{ matrix.shard }})
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.frontend-mutation-shards.outputs.list) }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: test_project-frontend
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image the suites run in
+        run: docker build -f apps/web/Dockerfile --target tester -t test-project-frontend-test .
+      # The incremental file only diffs files holding mutants or tests, so whatever else a test reaches
+      # (config, setup, shared base components) goes in the key, and so in the restore-keys fallback.
+      - name: Name the incremental cache key
+        env:
+          INPUTS: >-
+            ${{ hashFiles(
+            'test_project-frontend/package-lock.json',
+            'test_project-frontend/apps/web/stryker.config.json',
+            'test_project-frontend/apps/web/vitest.*',
+            'test_project-frontend/apps/web/src/components/base/**') }}
+        run: echo "STRYKER_CACHE_KEY=stryker-${{ matrix.shard }}-$INPUTS" >> "$GITHUB_ENV"
+      # Restore and save are separate: the combined action writes nothing when the job fails, and a
+      # red run's settled mutants are worth keeping.
+      - name: Restore what the last run already settled
+        uses: actions/cache/restore@v4
+        with:
+          path: test_project-frontend/apps/web/reports/mutation/stryker-incremental.json
+          key: ${{ env.STRYKER_CACHE_KEY }}-${{ github.sha }}
+          restore-keys: ${{ env.STRYKER_CACHE_KEY }}-
+      # reports/ is bind-mounted, so the incremental file goes in and the report comes back out.
+      - name: Run mutation tests
+        run: |
+          mkdir -p apps/web/reports
+          docker run --rm -v "$PWD/apps/web/reports:/repo/apps/web/reports" -w /repo/apps/web \
+            test-project-frontend-test sh -c '
+              npx stryker run --incremental --incrementalFile reports/mutation/stryker-incremental.json \
+                --mutate "$(node scripts/mutation-shards.mjs ${{ matrix.shard }})" &&
+              node ../../packages/mutation-check/check-mutants.mjs .'
+      - name: Save what this run settled
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: test_project-frontend/apps/web/reports/mutation/stryker-incremental.json
+          key: ${{ env.STRYKER_CACHE_KEY }}-${{ github.sha }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stryker-report-${{ matrix.shard }}
+          path: test_project-frontend/apps/web/reports/mutation
+          retention-days: 7
+
+
+  # No device/emulator e2e here (Detox/Maestro would need a real Android emulator, and a macOS
+  # runner for iOS) - unit/component coverage only, same bar as apps/web, until that's worth the
+  # added CI cost and flakiness.
+  mobile:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: test_project-frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci
+      - run: npm run build:packages
+      - name: Type-check and test
+        working-directory: test_project-frontend/apps/mobile
+        run: |
+          npm run lint:types
+          npm run test
+
+  mobile-mutation:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: test_project-frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci
+      - run: npm run build:packages
+      - name: Run mutation tests
+        working-directory: test_project-frontend/apps/mobile
+        run: npm run test:mutation
+
+
+  e2e:
+    runs-on: ubuntu-latest
+    needs: [backend, frontend, schema]
+    steps:
+      - uses: actions/checkout@v4
+      # Needed even though e2e/.env is committed: docker compose still resolves the root
+      # compose file's own ${...} interpolations (DB/broker creds, DOMAIN) against .env in the
+      # project directory (see e2e/.env's header comment) - e2e/.env only overrides what the e2e
+      # environment specifically needs to differ.
+      - run: cp .env.example .env
+      # Split rather than `up -d --build`: worker/scheduler share backend's image tag with no
+      # build of their own, and starting them before that build finishes tagging the image can
+      # race compose into pulling it instead of using what was just built.
+      - name: Build the full stack
+        working-directory: e2e
+        run: docker compose build
+      - name: Start the full stack
+        working-directory: e2e
+        run: docker compose up -d
+      - name: Run the auth e2e suite
+        working-directory: e2e
+        run: docker compose run --build --rm playwright npx playwright test --reporter=list
+      # Again behind a TLS-terminating proxy, the shape of production: nginx itself only ever sees http there.
+      - name: Run social login behind a TLS-terminating proxy
+        working-directory: e2e
+        run: |
+          export COMPOSE_FILE="$(sed -n 's/^COMPOSE_FILE=//p' .env):docker-compose.tls-proxy-for-e2e.yml"
+          docker compose up -d --wait tls-proxy dns
+          docker compose run --rm -e E2E_BASE_URL=https://testproject.test playwright \
+            npx playwright test auth/social-login.spec.ts --reporter=list
+      # A service failing its own healthcheck reports only "unhealthy" in the step above - the
+      # reason lives in that service's own log, which `up`/`run` never print on their own.
+      - if: failure()
+        name: Show service logs (only reached if a step above failed)
+        working-directory: e2e
+        run: docker compose logs --no-color
+      - if: always()
+        name: Upload Playwright report
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: e2e/playwright/playwright-report
+          retention-days: 7
+      - if: always()
+        working-directory: e2e
+        run: docker compose down -v --remove-orphans
