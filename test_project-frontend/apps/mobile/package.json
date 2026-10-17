@@ -1,0 +1,44 @@
+{
+  "name": "mobile",
+  "private": true,
+  "main": "expo-router/entry",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo start --android",
+    "ios": "expo start --ios",
+    "lint:types": "tsc --noEmit",
+    "test": "jest --coverage && node ../../packages/mutation-check/check-coverage.mjs .",
+    "test:mutation": "stryker run && node ../../packages/mutation-check/check-mutants.mjs ."
+  },
+  "dependencies": {
+    "@test-project/auth-api": "*",
+    "web": "*",
+    "@isikk/core": "^0.14.0",
+    "@react-native-google-signin/google-signin": "^16.1.5",
+    "expo": "~57.0.25",
+    "expo-apple-authentication": "~57.0.2",
+    "expo-localization": "~57.0.2",
+    "expo-router": "~57.0.23",
+    "expo-secure-store": "~57.0.4",
+    "expo-status-bar": "~57.0.1",
+    "i18next": "^26.4.2",
+    "react": "^19.2.3",
+    "react-i18next": "^17.0.15",
+    "react-native": "0.86.3",
+    "react-native-safe-area-context": "~5.7.0",
+    "react-native-screens": "~4.26.0"
+  },
+  "devDependencies": {
+    "babel-preset-expo": "~57.0.13",
+    "@jest/test-sequencer": "^30.5.2",
+    "@stryker-mutator/core": "^10.0.0",
+    "@stryker-mutator/jest-runner": "^10.0.0",
+    "@testing-library/react-native": "^14.0.1",
+    "@types/jest": "^29.5.0",
+    "@types/react": "^19.2.3",
+    "fast-check": "^3.23.0",
+    "jest": "^30.5.2",
+    "jest-expo": "~57.0.5",
+    "typescript": "^5.6.0"
+  }
+}
