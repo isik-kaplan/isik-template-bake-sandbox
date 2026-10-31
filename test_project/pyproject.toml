@@ -1,0 +1,123 @@
+[project]
+name = "test_project"
+dynamic = ["version"]
+description = "A test project generated for template validation."
+requires-python = ">=3.14"
+dependencies = [
+    # The newest every dependency allows: django-celery-beat 2.9.0 caps it below 6.1. Lift it, and move mail
+    # settings to MAILERS, once a release supports 6.1.
+    "django>=6.0,<6.1",
+    "psycopg[binary]>=3.2.0",
+    "isik[django,drf,sentry,celery,notifications,push]>=0.44.0",
+    "pyuwsgi>=2.0.28",
+    "python-dotenv>=1.0.0",
+    "drf-spectacular>=0.27.0",
+    "django-hosts>=6.0",
+    # "mfa" pulls in fido2 (passkeys) and qrcode, which allauth.mfa imports but does not require.
+    "django-allauth[mfa]>=65.21.0",
+    # For openid_connect's id_token verification; allauth only pulls it in with an extra.
+    "pyjwt[crypto]>=2.13.0",
+    "django-cors-headers>=4.4.0",
+    "django-oauth-toolkit>=3.4.1",
+    "django-msgspec>=1.0.1",
+    "cryptography>=49.0.0",
+    "requests>=2.32.0",
+    "celery>=5.5.0",
+    "django-celery-beat>=2.9.0",
+    "django-celery-results>=2.6.0",
+    "django-storages[s3]>=1.14.0",
+    "redis>=8.1.0",
+]
+
+[tool.uv]
+package = false
+dev-dependencies = [
+    # mutmut 3.7 reads pytest's private item._nodeid, which 9.2 removed; lift with mutmut 3.8.1.
+    "pytest>=8.0.0,<9.2",
+    "pytest-django>=4.9.0",
+    "pytest-cov>=5.0.0",
+    "pytest-xdist>=3.6.0",
+    "hypothesis>=6.130.0",
+    # Pinned: 3.8.0 renamed internals scripts/mutation_run.py calls. Bump together with that file.
+    "mutmut==3.7.0",
+    "ruff>=0.9.0",
+    "pre-commit>=3.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "test_project/__init__.py"
+
+[tool.ruff]
+line-length = 120
+fix = true
+extend-exclude = ["*/migrations/*"]
+
+[tool.ruff.lint]
+# T20 bans `print`: a command writes to `self.stdout`, everything else logs.
+select = ["E", "F", "I", "UP", "B", "T20", "TID251"]
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"logging.getLogger".msg = "Declare an event in apps/common/logging/events.py and write it with log() or audit()."
+"logging.Logger".msg = "Declare an event in apps/common/logging/events.py and write it with log() or audit()."
+
+[tool.ruff.lint.per-file-ignores]
+"apps/common/logging/emit.py" = ["TID251"]
+"scripts/*" = ["T20"]
+
+[tool.ruff.lint.isort]
+lines-after-imports = 2
+known-first-party = ["apps"]
+# So the order does not depend on whether the project name sorts before "apps".
+section-order = ["future", "standard-library", "third-party", "first-party", "project", "local-folder"]
+
+[tool.ruff.lint.isort.sections]
+project = ["test_project"]
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "test_project.settings"
+addopts = "-n auto --dist loadfile --cov --cov-report=term-missing --strict-markers"
+# pytest's own defaults plus `mutants`.
+norecursedirs = ["*.egg", ".*", "_darcs", "build", "CVS", "dist", "node_modules", "venv", "{arch}", "mutants"]
+
+[tool.coverage.run]
+source = ["apps", "test_project"]
+branch = true
+# Deployment glue the test suite never imports.
+omit = ["*/migrations/*", "*/wsgi.py", "*/asgi.py", "*/celery.py"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 100
+# Every exclusion lives here as an exact-text pattern, never an inline pragma, so an edited line
+# stops matching. Only for what the suite genuinely cannot reach.
+exclude_lines = [
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    # Only false in the e2e stack.
+    "if not config\\.RATE_LIMITS\\.ENABLED:",
+    # No test environment configures SENTRY__DSN.
+    "if config\\.SENTRY\\.DSN:",
+]
+
+[tool.mutmut]
+source_paths = ["apps", "test_project"]
+do_not_mutate = ["*/migrations/*", "*/tests/*", "*/conftest.py", "*/wsgi.py", "*/asgi.py", "*/celery.py"]
+# Outside source_paths, but the tests need them in the copied tree. The mutation job compiles the
+# locale catalogs first, or nothing translated is measured where translation works.
+also_copy = [
+    "conftest.py",
+    "templates",
+    "scripts",
+    "mutation-equivalents.toml",
+    "mutation-exemptions.toml",
+    "locale",
+]
+# --no-cov: mutmut's trampolines break the coverage gate. -n 0: xdist workers would share one test
+# database; --max-children isolates mutants instead.
+pytest_add_cli_args = ["--no-cov", "-n", "0", "-p", "scripts.mutation_test_order"]

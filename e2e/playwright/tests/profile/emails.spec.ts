@@ -1,0 +1,63 @@
+import { expect, test } from '@playwright/test'
+
+import { login, proveWithPassword, signUpAndVerify } from '../helpers'
+import { extractLinkFromEmail } from '../mailpit'
+
+test('adding, verifying, promoting, and removing a secondary email all work end to end', async ({ page }) => {
+  const username = `emails-${Date.now()}`
+  const primaryEmail = `${username}@example.test`
+  const secondaryEmail = `${username}-secondary@example.test`
+  await signUpAndVerify(page, username, primaryEmail, 'correct-horse-battery-staple')
+  await login(page, username, 'correct-horse-battery-staple')
+  // login() doesn't wait for the redirect; a goto() right after would race the session cookie.
+  await expect(page.getByText(`Signed in as ${username}.`)).toBeVisible()
+
+  await page.goto('/profile/emails')
+  // The profile header also shows the primary address, so scope to the list.
+  const emailsList = page.getByRole('list')
+  await expect(emailsList.getByText(primaryEmail)).toBeVisible()
+
+  // Signing in is not a proof, so adding the address asks for one first and comes back to finish.
+  await page.getByPlaceholder('Email').fill(secondaryEmail)
+  await page.getByRole('button', { name: 'Add email' }).click()
+  await proveWithPassword(page, 'correct-horse-battery-staple')
+  await expect(page).toHaveURL('/profile/emails')
+  await page.getByPlaceholder('Email').fill(secondaryEmail)
+  await page.getByRole('button', { name: 'Add email' }).click()
+  const secondaryRow = page.getByRole('listitem').filter({ hasText: secondaryEmail })
+  await expect(secondaryRow.getByText('Unverified')).toBeVisible()
+
+  await secondaryRow.getByRole('button', { name: 'Email actions' }).click()
+  await page.getByText('Resend verification').click()
+  await expect(page.getByText('Verification email sent.')).toBeVisible()
+
+  const verifyLink = await extractLinkFromEmail(secondaryEmail, '/auth/verify-email/')
+  await page.goto(verifyLink)
+  await page.getByRole('button', { name: 'Confirm email address' }).click()
+  // Already signed in, so home rather than /auth/login.
+  await expect(page).toHaveURL('/')
+
+  await page.goto('/profile/emails')
+  // exact: "Verified" is a substring of "Unverified".
+  await expect(secondaryRow.getByText('Verified', { exact: true })).toBeVisible()
+
+  // Adding the address spent its proof, so this act asks again.
+  await secondaryRow.getByRole('button', { name: 'Email actions' }).click()
+  await page.getByText('Make primary').click()
+  await proveWithPassword(page, 'correct-horse-battery-staple')
+  await expect(page).toHaveURL('/profile/emails')
+  await secondaryRow.getByRole('button', { name: 'Email actions' }).click()
+  await page.getByText('Make primary').click()
+  await expect(page.getByText('Email set as primary.')).toBeVisible()
+  await expect(secondaryRow.getByText('Primary')).toBeVisible()
+
+  const primaryRow = page.getByRole('listitem').filter({ hasText: primaryEmail })
+  await primaryRow.getByRole('button', { name: 'Email actions' }).click()
+  await page.getByText('Remove').click()
+  await proveWithPassword(page, 'correct-horse-battery-staple')
+  await primaryRow.getByRole('button', { name: 'Email actions' }).click()
+  await page.getByText('Remove').click()
+  await expect(page.getByText('Email removed.')).toBeVisible()
+  // Scoped to the list: the header still shows the stale primary until a full navigation.
+  await expect(page.getByRole('listitem').filter({ hasText: primaryEmail })).toHaveCount(0)
+})

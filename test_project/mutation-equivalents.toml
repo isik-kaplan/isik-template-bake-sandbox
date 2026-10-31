@@ -1,0 +1,182 @@
+# Single mutants no test can kill, because the system behaves identically with them. Each is skipped
+# by phase one and subtracted from the survivor list in phase two.
+#
+# The bar is behavior. A test that asserts what a call returned, what it wrote or what a user sees
+# kills a mutant; asserting the arguments a mock received does not, and neither does reading a
+# spelling back out of a header. An escape hatch from a policy, so it is guarded like one:
+#
+#   * every entry needs a `reason` long enough to be one, or scripts/confirm_survivors.py rejects the
+#     file.
+#   * an entry whose mutant is now killed fails the build - an unnecessary exemption is how a list
+#     like this becomes a way of ignoring the policy. `python -m scripts.toolbox.check_exemption_keys`
+#     (run by CI) finds one whose mutant no longer exists at all.
+#   * an entry may name a test with `verified_by`, and then that test re-checks it instead of the
+#     re-run. Only for a reason that rests on a library's behavior rather than this codebase's own -
+#     a case-insensitive header, an argument a library method never reads - and the test must make
+#     the real call the reason is about, not a stand-in that looks similar. The re-run it replaces can
+#     only ever observe "nothing killed it"; the test asserts the reason itself, on every push.
+#     apps/common/tests/test_mutation_registries.py refuses one that names a test nobody defines.
+#
+# A name is the mutation, hashed (scripts/mutation_naming.py), so an entry follows its mutant through
+# any edit that leaves the mutation in place and stops resolving the moment one does not. Read the
+# names and diffs off `python -m scripts.toolbox.triage <report> --diffs`.
+#
+# Quote the name: TOML reads a bare `[a.b.c]` as nested tables, so an unquoted entry matches nothing.
+#
+# A function mutmut's tracing cannot attribute to any test at all belongs in mutation-exemptions.toml
+# instead, which is keyed by function.
+
+["apps.users.adapters.social_account.xǁSocialAccountAdapterǁpopulate_user__mutmut__7b105d92b12d"]
+reason = """Passes None instead of the request to super().populate_user(request, sociallogin, data).
+allauth's DefaultSocialAccountAdapter.populate_user() never reads its request parameter - it only
+touches `data` and `sociallogin.user` - so no test can observe which one was passed."""
+verified_by = "apps/common/tests/test_library_assumptions.py::test_populate_user_never_reads_the_request"
+
+["apps.users.adapters.account.xǁAccountAdapterǁsave_user__mutmut__70a6420569e2"]
+reason = """Passes None instead of the request to super().save_user(request, user, form, commit=commit).
+allauth's DefaultAccountAdapter.save_user() only hands its request to populate_username(), which never
+reads it either - it fills a username from the user's own fields - so no test can observe which one was
+passed."""
+verified_by = "apps/common/tests/test_library_assumptions.py::test_save_user_never_reads_the_request"
+
+["apps.users.api.viewsets.user.x__mark_partial__mutmut__1a1b3d6410e6"]
+reason = """Flips `serializer.partial = True` to False. Nothing in UserSerializer is required
+(id/created_at/updated_at are read-only, username/email are read-only on update via
+create_only_fields, first_name/last_name/language are all blank=True), and ModelSerializer.update()
+only sets fields present in the request body regardless of `partial` - an empty-body PATCH returns 200
+either way. Stops being equivalent the day a required field is added."""
+
+["apps.users.api.viewsets.user.x__mark_partial__mutmut__de2cdac5f87a"]
+reason = """Sets `serializer.partial = None` instead of True. DRF only ever reads `partial` for its
+truth value, so None behaves as False - and False is equivalent here for the reason the entry above
+gives: nothing in UserSerializer is required, so partial validation and full validation agree."""
+
+["apps.common.middleware.language.xǁUserLanguageMiddlewareǁ__call____mutmut__ddadfc18aac5"]
+reason = """Spells the header "content-language" instead of "Content-Language". Django's
+HttpResponse.headers is case-insensitive on write and on read, so every spelling sets the same header
+and no test can observe which one was written."""
+verified_by = "apps/common/tests/test_library_assumptions.py::test_a_response_header_is_case_insensitive"
+
+["apps.common.middleware.language.xǁUserLanguageMiddlewareǁ__call____mutmut__2d568dee1fcb"]
+reason = """Spells the header "CONTENT-LANGUAGE" instead of "Content-Language". Django's
+HttpResponse.headers is case-insensitive on write and on read, so every spelling sets the same header
+and no test can observe which one was written."""
+verified_by = "apps/common/tests/test_library_assumptions.py::test_a_response_header_is_case_insensitive"
+
+["apps.oauth_provider.views.authorization.xǁAuthorizationViewǁget__mutmut__07b657780af2"]
+reason = """Drops **kwargs from the call to DOT's own AuthorizationView.get. The authorize route captures no
+URL parameters (apps/oauth_provider/urls.py routes it as a bare "authorize/"), so kwargs is always
+empty and the call is the same with or without it."""
+
+["apps.oauth_provider.views.authorization.xǁAuthorizationViewǁget__mutmut__5e386713e2aa"]
+reason = """Drops *args from the call to DOT's own AuthorizationView.get. The authorize route captures no
+URL parameters, so args is always empty and the call is the same with or without it."""
+
+["apps.oauth_provider.views.authorization.xǁAuthorizationViewǁget__mutmut__1e42aaa3c272"]
+reason = """Turns the default for a missing `prompt` from "" into "XXXX". Either way the default splits into
+words none of which is "login", so a request without `prompt` goes on to DOT's consent exactly as
+before - only the presence of the word matters, never what stands in for its absence."""
+
+["apps.oauth_provider.api.viewsets.authorized_application.xǁAuthorizedApplicationViewSetǁlist__mutmut__3ff94bdd20ea"]
+reason = """select_related(None) instead of select_related("application") on the access tokens. It only
+decides whether each token's application arrives in the same query or one more apiece; the list built
+from them is the same either way."""
+
+["apps.oauth_provider.api.viewsets.authorized_application.xǁAuthorizedApplicationViewSetǁlist__mutmut__eb4aecaf69b5"]
+reason = """select_related(None) instead of select_related("application") on the refresh tokens - the same
+query-count-only difference as the access tokens' entry above."""
+
+["apps.oauth_provider.api.viewsets.application.xǁApplicationViewSetǁget_queryset__mutmut__6a44d463dd58"]
+reason = """prefetch_related("approved_scopes") alone instead of with "requested_scopes". It only decides
+whether each application's requested scopes arrive in one query for the page or one more apiece; what
+the list says is the same either way."""
+
+["apps.oauth_provider.api.viewsets.application.xǁApplicationViewSetǁget_queryset__mutmut__b5f5432e2f52"]
+reason = """prefetch_related("requested_scopes") alone instead of with "approved_scopes" - the same
+query-count-only difference as the entry above, for the approved scopes."""
+
+["apps.oauth_provider.api.viewsets.reviewed_application.xǁReviewedApplicationViewSetǁget_queryset__mutmut__1369ae966a2d"]
+reason = """select_related(None) instead of select_related("user"). It only decides whether each
+application's owner arrives in the same query or one more apiece; the owner shown is the same."""
+
+["apps.oauth_provider.api.viewsets.reviewed_application.xǁReviewedApplicationViewSetǁget_queryset__mutmut__7187222b8f02"]
+reason = """prefetch_related("requested_scopes") alone instead of with "approved_scopes": a query count,
+not a different answer, as for the owner's own list."""
+
+["apps.oauth_provider.api.viewsets.reviewed_application.xǁReviewedApplicationViewSetǁget_queryset__mutmut__9bddde150be6"]
+reason = """prefetch_related("approved_scopes") alone instead of with "requested_scopes": a query count,
+not a different answer, as for the owner's own list."""
+
+["apps.users.api.viewsets.user.xǁUserViewSetǁget_queryset__mutmut__7aa4b59b8812"]
+reason = """prefetch_related(None) instead of prefetch_related("user_permissions"). Each account's
+granted permissions then arrive one query apiece rather than in one for the page; the permissions shown
+are the same."""
+
+["apps.users.api.viewsets.user.xǁUserViewSetǁget_queryset__mutmut__50d0818c52cb"]
+reason = """Reads a missing may_see_every_account as None instead of False. Both are falsy, so whoever
+lacks the attribute is narrowed to their own account either way."""
+
+["apps.users.api.viewsets.user.xǁUserViewSetǁget_queryset__mutmut__a977548baaf9"]
+reason = """Reads a missing may_see_every_account as True. Only somebody signed out lacks it - an
+AnonymousUser - and IsAuthenticated refuses them before any action reads the queryset, so no request
+that reaches this line is told anything different."""
+
+["apps.users.api.fields.scope.xǁScopeFieldǁ__init____mutmut__2ac5f9b8a4e4"]
+reason = """Drops the keyword arguments passed on to SlugRelatedField. ScopeField is only ever declared
+many=True, where DRF's many_init hands required, read_only and help_text to the ManyRelatedField it builds
+around this one, so the child's own keyword arguments change nothing a request or the API document sees."""
+
+["apps.users.authentication.xǁPersonalAccessTokenAuthenticationǁauthenticate__mutmut__b6e5ba0b670d"]
+reason = """select_related(None) instead of select_related("user"). The token's owner then arrives in a
+second query rather than the first; it is the same person, checked and returned the same way."""
+
+["apps.users.api.viewsets.personal_access_token.xǁPersonalAccessTokenViewSetǁget_queryset__mutmut__d82fa0044935"]
+reason = """prefetch_related(None) instead of prefetch_related("scopes"). Each token's scopes then
+arrive one query apiece rather than in one for the page; the scopes shown are the same."""
+
+["apps.users.backends.permissions.xǁPermissionsBackendǁget_all_permissions__mutmut__75d49614b768"]
+reason = """Asks whether None has a _perm_cache, which it never does, so the closure is recomputed on every
+question instead of once per user object. It is recomputed from get_user_permissions and
+get_group_permissions, which keep caches of their own on the user object (Django's ModelBackend), so
+the answer is the same one the cache would have given."""
+
+["apps.users.backends.permissions.xǁPermissionsBackendǁget_all_permissions__mutmut__8962004ce04d"]
+reason = """Looks for the cache under another attribute name than the one it is stored under, so the
+closure is recomputed every time - from the raw grants ModelBackend caches on the user object itself,
+which gives the same answer as the cached closure. See the entry above."""
+
+["apps.users.backends.permissions.xǁPermissionsBackendǁget_all_permissions__mutmut__eb488772d483"]
+reason = """Looks for the cache as _PERM_CACHE, which is never set, so the closure is recomputed every
+time from ModelBackend's own cached raw grants - the same answer. See the two entries above."""
+
+["apps.common.files.x_serve_file__mutmut__3bee847eb113"]
+reason = """Spells the header "content-disposition" instead of "Content-Disposition". Django's
+HttpResponse.headers is case-insensitive on write and on read, and so is nginx, which passes it on, so
+every spelling sets the same header and no test can observe which one was written."""
+verified_by = "apps/common/tests/test_library_assumptions.py::test_a_response_header_is_case_insensitive"
+
+["apps.common.files.x_serve_file__mutmut__d53c539c29bd"]
+reason = """Spells the header "CONTENT-DISPOSITION" instead of "Content-Disposition". Django's
+HttpResponse.headers is case-insensitive on write and on read, and so is nginx, which passes it on, so
+every spelling sets the same header and no test can observe which one was written."""
+verified_by = "apps/common/tests/test_library_assumptions.py::test_a_response_header_is_case_insensitive"
+
+["apps.users.reauthentication.views.manage_totp.xǁManageTOTPViewǁget__mutmut__07b657780af2"]
+reason = """Drops **kwargs from the call to allauth's own ManageTOTPView.get. The TOTP route captures no URL
+parameters (allauth.headless.mfa.urls routes it as a bare "totp", and gated_headless_urlpatterns()
+keeps allauth's route), so kwargs is always empty and the call is the same with or without it."""
+
+["apps.users.reauthentication.views.manage_totp.xǁManageTOTPViewǁget__mutmut__5e386713e2aa"]
+reason = """Drops *args from the call to allauth's own ManageTOTPView.get. The TOTP route captures no URL
+parameters, so args is always empty and the call is the same with or without it."""
+
+["apps.notifications.keys.x_kind_key__mutmut__f8d74f3bb737"]
+reason = """Spells the reference "notifications.noticekindpolicy" instead of "notifications.NoticeKindPolicy".
+Django looks a model reference up case-insensitively and lowercases it when the field is deconstructed, so
+both spellings name the same model, make the same migration, and no test can observe which one was written."""
+verified_by = "apps/common/tests/test_library_assumptions.py::test_a_model_reference_is_case_insensitive"
+
+["apps.users.api.serializers.personal_access_token.xǁPersonalAccessTokenSerializerǁvalidate_expires_at__mutmut__d2ce5e3adb81"]
+reason = """Refuses an expiry exactly at the lifetime's end instead of only one past it. `now` is read on the
+server as the request is validated, after any client chose its expiry, so no request can name that very
+microsecond: the two comparisons answer every request the same."""
