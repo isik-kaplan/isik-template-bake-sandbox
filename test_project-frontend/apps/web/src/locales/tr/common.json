@@ -1,0 +1,18 @@
+{
+  "editAction": "",
+  "saveAction": "",
+  "savingAction": "",
+  "cancelAction": "",
+  "previousPage": "",
+  "nextPage": "",
+  "pageOfTotal": "",
+  "tooManyRequestsTitle": "",
+  "tooManyRequests": "",
+  "tooManyRequestsFor_one": "",
+  "tooManyRequestsFor_other": "",
+  "tryAgain": "",
+  "staleChanged": "",
+  "conflictTitle": "",
+  "conflictTakeTheirs": "",
+  "conflictKeepMine": ""
+}

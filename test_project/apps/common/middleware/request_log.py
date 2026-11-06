@@ -1,0 +1,49 @@
+"""One line per request, whatever the view does; `redaction` decides what it may say."""
+
+import time
+
+from django.db import connection
+from isik.django.apps.common.middleware import Middleware
+from isik.django.apps.common.middleware.history import REQUEST_ID_HEADER
+
+from apps.common.logging import REQUEST, log
+from apps.common.logging.emit import ambient
+from apps.common.logging.redaction import body_of, client_ip_of, headers_of, query_of, worth_logging
+
+
+class RequestLogMiddleware(Middleware):
+    """Below `HistoryContextMiddleware`, so its context is open when the response comes back up."""
+
+    def __call__(self, request):
+        started = time.monotonic()
+        # Before the view, which may consume the stream.
+        body = body_of(request)
+        queries = 0
+
+        # Not `queries_log`, which Django fills only under DEBUG.
+        def count(execute, *query):
+            nonlocal queries
+            queries += 1
+            return execute(*query)
+
+        with connection.execute_wrapper(count):
+            response = self.get_response(request)
+        # Handed back, so somebody on an error page can quote the id every log of the request carries.
+        request_id = ambient().get("request_id")
+        if request_id:
+            response[REQUEST_ID_HEADER] = request_id
+        elapsed_ms = round((time.monotonic() - started) * 1000)
+        if worth_logging(response.status_code, elapsed_ms):
+            log(
+                REQUEST,
+                method=request.method,
+                path=request.path,
+                status=response.status_code,
+                duration_ms=elapsed_ms,
+                db_queries=queries,
+                client_ip=client_ip_of(request),
+                query=query_of(request) or None,
+                body=body or None,
+                headers=headers_of(request),
+            )
+        return response

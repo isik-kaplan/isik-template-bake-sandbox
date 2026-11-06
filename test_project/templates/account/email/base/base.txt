@@ -1,0 +1,6 @@
+{{ site_name }}
+
+{% block content %}
+{% endblock content %}
+
+{% blocktrans %}Thank you for using {{ site_name }}.{% endblocktrans %}

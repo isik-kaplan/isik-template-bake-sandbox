@@ -1,0 +1,50 @@
+"""Expired tokens are deleted on a schedule (the beat), and only expired ones."""
+
+from datetime import timedelta
+
+import pytest
+from django.core.management import call_command
+from django.utils import timezone
+from oauth2_provider.models import get_access_token_model
+
+from apps.oauth_provider.tasks import clear_expired_tokens
+
+from test_project.celery import app
+
+
+AccessToken = get_access_token_model()
+
+
+def _token(application, expires):
+    return AccessToken.objects.create(
+        user=application.user, application=application, token=f"t-{expires.timestamp()}", expires=expires
+    )
+
+
+@pytest.mark.django_db
+def test_an_expired_token_goes_and_a_live_one_stays(application, logged):
+    """Both halves: a cleanup that deleted everything would sign every client out at once."""
+    dead = _token(application, timezone.now() - timedelta(days=1))
+    alive = _token(application, timezone.now() + timedelta(days=1))
+
+    clear_expired_tokens()
+
+    assert set(AccessToken.objects.values_list("pk", flat=True)) == {alive.pk}
+    assert not AccessToken.objects.filter(pk=dead.pk).exists()
+    assert [line["event"] for line in logged] == ["oauth.expired_tokens_cleared"]
+
+
+@pytest.mark.django_db
+def test_the_command_runs_the_same_cleanup(application):
+    dead = _token(application, timezone.now() - timedelta(days=1))
+
+    call_command("clear_expired_tokens")
+
+    assert not AccessToken.objects.filter(pk=dead.pk).exists()
+
+
+def test_the_beat_runs_it_daily():
+    entry = app.conf.beat_schedule["clear-expired-tokens"]
+
+    assert entry["task"] == clear_expired_tokens.name
+    assert (entry["schedule"].hour, entry["schedule"].minute) == ({4}, {30})
