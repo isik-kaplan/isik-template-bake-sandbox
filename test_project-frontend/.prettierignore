@@ -1,0 +1,12 @@
+node_modules
+.next
+dist
+coverage
+reports
+.stryker-tmp
+package-lock.json
+apps/web/src/components/base
+packages/*/src/schema.ts
+apps/web/next-env.d.ts
+# Legal text is content, and reformatting it would change the version every signup records.
+apps/web/src/legal/**/*.md

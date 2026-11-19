@@ -1,0 +1,1 @@
+{% load i18n %}{% blocktrans %}A personal access token was created{% endblocktrans %}

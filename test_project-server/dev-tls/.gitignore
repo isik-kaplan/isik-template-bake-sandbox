@@ -1,0 +1,3 @@
+# scripts/dev-tls.sh output: a local certificate and key.
+*
+!.gitignore

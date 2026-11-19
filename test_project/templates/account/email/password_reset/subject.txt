@@ -1,0 +1,1 @@
+{% autoescape off %}{% blocktrans %}Password reset{% endblocktrans %}{% endautoescape %}

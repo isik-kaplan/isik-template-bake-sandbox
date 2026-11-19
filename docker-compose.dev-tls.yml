@@ -1,0 +1,14 @@
+# Local https for development, added to COMPOSE_FILE by scripts/dev-tls.sh. An override so a deployment
+# behind its own TLS proxy never publishes :443.
+services:
+  frontend:
+    volumes:
+      # The local CA, so server-side fetches to https://api./auth.<domain> verify (NODE_EXTRA_CA_CERTS).
+      - ./test_project-server/dev-tls:/etc/dev-tls:ro
+
+  server:
+    volumes:
+      # nginx includes *.conf from here inside both server blocks.
+      - ./test_project-server/dev-tls:/etc/nginx/extra-listen:ro
+    ports:
+      - "127.0.0.1:${TEST_PROJECT__HTTPS_PORT:-443}:443"
