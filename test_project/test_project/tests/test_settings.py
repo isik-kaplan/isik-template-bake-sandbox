@@ -1,0 +1,176 @@
+import os
+import subprocess
+import sys
+
+import pytest
+from allauth.utils import build_absolute_uri
+from django.conf import settings
+from django.test import RequestFactory, override_settings
+from isik.django.apps.common.checks import Check, CheckOption, Severity
+
+from apps.common.storages import configured_storage
+
+from test_project import settings as project_settings
+from test_project.config import CONFIG as config
+from test_project.settings import _origins
+
+
+def test_social_login_installs_and_configures_exactly_the_named_providers():
+    """A fresh interpreter, since settings are built once, at import."""
+    script = (
+        "from test_project import settings; "
+        "print([app for app in settings.INSTALLED_APPS if '.providers.' in app]); "
+        "print(sorted(settings.SOCIALACCOUNT_PROVIDERS))"
+    )
+    providers = "github,openid_connect:corp,google,openid_connect:customers"
+    env = {**os.environ, "TEST_PROJECT__SOCIAL_LOGIN__PROVIDERS": providers}
+
+    result = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, check=True)
+
+    # Two issuers, one provider: installed once.
+    assert result.stdout.splitlines()[-2:] == [
+        "['allauth.socialaccount.providers.github', 'allauth.socialaccount.providers.openid_connect', "
+        "'allauth.socialaccount.providers.google']",
+        "['github', 'google', 'openid_connect']",
+    ]
+
+
+def test_the_name_is_set_once_and_everything_server_side_reads_it():
+    """A fresh interpreter, since settings are built once, at import."""
+    script = (
+        "from test_project import settings; "
+        "print(settings.PROJECT_NAME); print(settings.MFA_TOTP_ISSUER); print(settings.SPECTACULAR_SETTINGS['TITLE'])"
+    )
+    env = {**os.environ, "TEST_PROJECT__NAME": "Renamed"}
+
+    result = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, check=True)
+
+    assert result.stdout.splitlines()[-3:] == ["Renamed", "Renamed", "Renamed API"]
+
+
+def test_the_name_defaults_to_the_one_the_project_was_made_with():
+    assert config.NAME == "Test Project"
+
+
+def test_the_signing_key_may_spell_its_line_breaks_as_backslash_n():
+    """A fresh interpreter, since settings are built once, at import."""
+    script = "from test_project import settings; print(repr(settings.OAUTH2_PROVIDER['OIDC_RSA_PRIVATE_KEY']))"
+    env = {
+        **os.environ,
+        "TEST_PROJECT__OAUTH_PROVIDER__MODE": "auto",
+        "TEST_PROJECT__OAUTH_PROVIDER__SIGNING_KEY": "-----BEGIN-----\\nkey\\n-----END-----",
+    }
+
+    result = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, check=True)
+
+    assert result.stdout.splitlines()[-1] == repr("-----BEGIN-----\nkey\n-----END-----")
+
+
+def test_origins_under_debug_accept_both_schemes_so_local_https_works_beside_http():
+    assert _origins(["a.test", "api.a.test"], True) == [
+        "http://a.test",
+        "https://a.test",
+        "http://api.a.test",
+        "https://api.a.test",
+    ]
+
+
+def test_origins_outside_debug_are_https_only():
+    assert _origins(["a.test", "api.a.test"], False) == ["https://a.test", "https://api.a.test"]
+
+
+# config.DEBUG, not settings.DEBUG: pytest-django forces the latter off after these lists were built.
+def test_csrf_trusts_the_frontend_and_every_backend_subdomain():
+    hosts = [config.DOMAIN, f"api.{config.DOMAIN}", f"admin.{config.DOMAIN}", f"auth.{config.DOMAIN}"]
+    assert settings.CSRF_TRUSTED_ORIGINS == _origins(hosts, config.DEBUG)
+
+
+@pytest.mark.django_db
+def test_the_frontend_may_send_an_idempotency_key_across_origins(client):
+    response = client.options(
+        "/v0/oauth-applications/",
+        HTTP_HOST=f"api.{config.DOMAIN}",
+        HTTP_ORIGIN=_origins([config.DOMAIN], config.DEBUG)[0],
+        HTTP_ACCESS_CONTROL_REQUEST_METHOD="POST",
+        HTTP_ACCESS_CONTROL_REQUEST_HEADERS="content-type,idempotency-key,x-csrftoken",
+    )
+
+    assert "idempotency-key" in response["Access-Control-Allow-Headers"].split(", ")
+    assert "x-csrftoken" in response["Access-Control-Allow-Headers"].split(", ")
+
+
+def test_cors_allows_only_the_frontends_origins():
+    assert settings.CORS_ALLOWED_ORIGINS == _origins([config.DOMAIN, f"admin.{config.DOMAIN}"], config.DEBUG)
+
+
+@pytest.mark.parametrize(
+    ("debug", "expected"),
+    [("false", ["31536000", "True", "False"]), ("true", ["0", "False", "False"])],
+)
+def test_outside_debug_browsers_stay_on_https_for_a_year_across_subdomains(debug, expected):
+    """Each DEBUG in an interpreter of its own, since settings are built once, at import."""
+    script = (
+        "from test_project import settings; "
+        "print(settings.SECURE_HSTS_SECONDS, settings.SECURE_HSTS_INCLUDE_SUBDOMAINS, "
+        "getattr(settings, 'SECURE_HSTS_PRELOAD', False))"
+    )
+    env = {**os.environ, "TEST_PROJECT__DEBUG": debug}
+
+    result = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, check=True)
+
+    assert result.stdout.splitlines()[-1].split() == expected
+
+
+def test_allauth_forces_https_links_exactly_when_the_frontend_is_https():
+    assert settings.ACCOUNT_DEFAULT_HTTP_PROTOCOL == ("http" if config.DEBUG else "https")
+
+
+def test_absolute_uris_follow_the_forwarded_https_scheme():
+    request = RequestFactory().get("/", HTTP_HOST=f"auth.{config.DOMAIN}", HTTP_X_FORWARDED_PROTO="https")
+
+    assert build_absolute_uri(request, "/callback/") == f"https://auth.{config.DOMAIN}/callback/"
+
+
+@override_settings(ACCOUNT_DEFAULT_HTTP_PROTOCOL="https")
+def test_absolute_uris_are_https_outside_debug_even_without_the_forwarded_scheme():
+    request = RequestFactory().get("/", HTTP_HOST=f"auth.{config.DOMAIN}")
+
+    assert build_absolute_uri(request, "/callback/") == f"https://auth.{config.DOMAIN}/callback/"
+
+
+def test_the_served_api_document_is_in_the_language_the_clients_were_generated_in():
+    assert settings.ISIK["DJANGO"]["SCHEMA_LANGUAGE"] == settings.LANGUAGE_CODE
+
+
+def test_a_view_outside_the_transaction_fails_startup_rather_than_warning():
+    """Idempotency keys and version checks count on ATOMIC_REQUESTS."""
+    assert settings.ISIK["DJANGO"]["CHECKS"][Check.NOT_ATOMIC] == {CheckOption.SEVERITY: Severity.ERROR}
+
+
+def test_uploads_go_where_the_storage_settings_say():
+    """The module's own: the suite runs on a storage of its own, swapped in over it."""
+    assert project_settings.STORAGES["default"] == configured_storage(
+        config.STORAGE.BACKEND,
+        bucket_name=config.STORAGE.BUCKET_NAME,
+        endpoint_url=config.STORAGE.ENDPOINT_URL,
+        access_key_id=config.STORAGE.ACCESS_KEY_ID,
+        secret_access_key=config.STORAGE.SECRET_ACCESS_KEY,
+        region_name=config.STORAGE.REGION_NAME,
+        addressing_style=config.STORAGE.ADDRESSING_STYLE,
+    )
+
+
+def test_the_providers_addressing_style_reaches_the_storage_backend():
+    """Fresh interpreters: settings are built once, at import. Path unless told: the bundled Garage takes no other."""
+    name = "TEST_PROJECT__STORAGE__ADDRESSING_STYLE"
+    style = "settings.STORAGES['default']['OPTIONS']['addressing_style']"
+    script = f"from test_project import settings; print({style})"
+    in_a_bucket = {**os.environ, "TEST_PROJECT__STORAGE__BACKEND": "s3"}
+    unset = {key: value for key, value in in_a_bucket.items() if key != name}
+    runs = [
+        subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, check=True)
+        for env in (unset, {**unset, name: "virtual"})
+    ]
+    styles = [run.stdout.split()[-1] for run in runs]
+
+    assert styles == ["path", "virtual"]

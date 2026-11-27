@@ -1,0 +1,85 @@
+import { useState } from 'react'
+
+import { Button, ErrorText, Heading, Screen, Text, TextField } from '@/components'
+
+import { useTranslation } from '@/lib/i18n'
+import { getAuthApi } from '@/lib/session'
+import { passwordsSignIn } from '@/lib/socialProviders'
+import { tooManyRequestsMessage } from '@/lib/tooManyRequests'
+
+import { errorsOf } from '@test-project/auth-api/app'
+
+import { Redirect } from 'expo-router'
+
+export default function ProfilePassword() {
+  return passwordsSignIn() ? <ChangePasswordForm /> : <Redirect href="/profile" />
+}
+
+function ChangePasswordForm() {
+  const { t } = useTranslation()
+  const [currentPassword, setCurrentPassword] = useState('')
+  const [newPassword, setNewPassword] = useState('')
+  const [error, setError] = useState<string | undefined>()
+  const [success, setSuccess] = useState(false)
+  const [submitting, setSubmitting] = useState(false)
+
+  async function submit() {
+    setSubmitting(true)
+    setError(undefined)
+    setSuccess(false)
+    try {
+      const {
+        data,
+        error: response,
+        response: http,
+      } = await getAuthApi().changePassword({
+        current_password: currentPassword,
+        new_password: newPassword,
+      })
+      const throttled = tooManyRequestsMessage(t, http)
+      if (throttled) {
+        setError(throttled)
+        return
+      }
+      if (data) {
+        setCurrentPassword('')
+        setNewPassword('')
+        setSuccess(true)
+        return
+      }
+      const authErrors = errorsOf(response)
+      setError(authErrors?.[0]?.message ?? t('profilePasswordError'))
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <Screen testID="profile-password-form" back>
+      <Heading testID="profile-password-heading">{t('profilePasswordHeading')}</Heading>
+      <TextField
+        testID="current-password-input"
+        placeholder={t('profilePasswordCurrentPlaceholder')}
+        secureTextEntry
+        value={currentPassword}
+        onChangeText={setCurrentPassword}
+      />
+      <TextField
+        testID="new-password-input"
+        placeholder={t('profilePasswordNewPlaceholder')}
+        secureTextEntry
+        value={newPassword}
+        onChangeText={setNewPassword}
+      />
+      {error && <ErrorText testID="profile-password-error">{error}</ErrorText>}
+      {success && <Text testID="profile-password-success">{t('profilePasswordSuccess')}</Text>}
+      <Button
+        testID="profile-password-submit"
+        labelTestID="profile-password-submit-label"
+        disabled={submitting}
+        onPress={submit}
+        label={submitting ? t('profilePasswordSubmitting') : t('profilePasswordSubmit')}
+      />
+    </Screen>
+  )
+}

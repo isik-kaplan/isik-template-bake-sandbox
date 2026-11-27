@@ -1,0 +1,181 @@
+import LoginPage from '@/app/auth/login/page'
+
+import { render, screen } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+const redirectIfAuthenticated = vi.fn()
+vi.mock('@/lib/getSession', () => ({
+  redirectIfAuthenticated: (...args: unknown[]) => redirectIfAuthenticated(...args),
+  getLanguage: async () => 'en',
+}))
+const request = vi.hoisted(() => ({ host: 'test-project.test' }))
+vi.mock('next/headers', () => ({ headers: async () => new Headers({ host: request.host }) }))
+const push = vi.fn()
+// Pinned: the form's fields follow the generated requirement and phone option.
+vi.mock('@/config/names', () => ({ nameRequirement: () => 'username_with_optional_full' }))
+vi.mock('@/config/phone', () => ({ PHONE: 'none' }))
+vi.mock('next/navigation', () => ({ useRouter: () => ({ push, refresh: vi.fn() }) }))
+vi.mock('@/config/public', () => ({ CONFIG: { DOMAIN: 'test-project.test' } }))
+vi.mock('@/lib/socialProviders', () => ({
+  signInProviders: () => [{ id: 'google', name: 'Google', icon: '', adminOnly: false }],
+}))
+const passwords = vi.hoisted(() => ({ signIn: true }))
+vi.mock('@/lib/passwords', () => ({ passwordsSignIn: () => passwords.signIn }))
+
+function jsonResponse(status: number, body: unknown) {
+  return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+}
+
+describe('LoginPage', () => {
+  const originalFetch = globalThis.fetch
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+    push.mockClear()
+    document.querySelectorAll('form').forEach((form) => form.remove())
+    passwords.signIn = true
+    request.host = 'test-project.test'
+  })
+
+  it('offers only the providers, with no divider or reset link, when nobody signs in with a password', async () => {
+    passwords.signIn = false
+    render(await LoginPage({ searchParams: Promise.resolve({}) }))
+
+    expect(screen.getByRole('button', { name: /Continue with Google/ })).toBeTruthy()
+    expect(screen.queryByLabelText('Password')).toBeNull()
+    expect(screen.queryByText('Or')).toBeNull()
+    expect(screen.queryByRole('link', { name: 'Forgot your password?' })).toBeNull()
+    expect(screen.getByRole('link', { name: 'Sign up' }).getAttribute('href')).toBe('/auth/signup')
+  })
+
+  it('checks whether the visitor is already logged in, redirecting to "next" if given', async () => {
+    render(await LoginPage({ searchParams: Promise.resolve({ next: '/dashboard' }) }))
+
+    expect(redirectIfAuthenticated).toHaveBeenCalledWith('/dashboard')
+  })
+
+  it('refuses to send anybody off this site once they are signed in', async () => {
+    render(await LoginPage({ searchParams: Promise.resolve({ next: 'https://elsewhere.test/' }) }))
+
+    expect(redirectIfAuthenticated).toHaveBeenCalledWith('/')
+  })
+
+  it("sends somebody back to the application's authorize request they came from", async () => {
+    const next = 'http://auth.test-project.test/o/authorize/?client_id=abc'
+    render(await LoginPage({ searchParams: Promise.resolve({ next }) }))
+
+    expect(redirectIfAuthenticated).toHaveBeenCalledWith(next)
+  })
+
+  it('defaults the redirect target to "/" when no next param is given', async () => {
+    render(await LoginPage({ searchParams: Promise.resolve({}) }))
+
+    expect(redirectIfAuthenticated).toHaveBeenCalledWith('/')
+  })
+
+  it('renders the exact title, no-account text, divider text, and links to sign up and reset', async () => {
+    render(await LoginPage({ searchParams: Promise.resolve({}) }))
+
+    expect(document.querySelector('[data-slot="card-title"]')?.textContent).toBe('Log in')
+    expect(screen.getByText(/Don't have an account\?/)).toBeTruthy()
+    expect(screen.getByText('Or')).toBeTruthy()
+    const signupLink = screen.getByRole('link', { name: 'Sign up' })
+    expect(signupLink.getAttribute('href')).toBe('/auth/signup')
+    const forgotLink = screen.getByRole('link', { name: 'Forgot your password?' })
+    expect(forgotLink.getAttribute('href')).toBe('/auth/forgot-password')
+  })
+
+  it('builds the social login action and callback URL from the request origin and "next"', async () => {
+    HTMLFormElement.prototype.submit = vi.fn()
+    globalThis.fetch = vi.fn(async () => new Response(null, { status: 200 }))
+    const user = userEvent.setup()
+    render(await LoginPage({ searchParams: Promise.resolve({ next: '/dashboard' }) }))
+
+    await user.click(screen.getByRole('button', { name: /Continue with Google/ }))
+
+    const forms = document.querySelectorAll('form')
+    const socialForm = Array.from(forms).find((form) => form.elements.namedItem('provider'))
+    expect(socialForm?.getAttribute('action')).toBe('http://auth.test-project.test/v0/browser/auth/provider/redirect')
+    expect((socialForm?.elements.namedItem('callback_url') as HTMLInputElement)?.value).toBe(
+      'http://test-project.test/auth/callback-complete?next=%2Fdashboard'
+    )
+  })
+
+  it('defaults the callback URL\'s "next" to "/" when none is given', async () => {
+    HTMLFormElement.prototype.submit = vi.fn()
+    globalThis.fetch = vi.fn(async () => new Response(null, { status: 200 }))
+    const user = userEvent.setup()
+    render(await LoginPage({ searchParams: Promise.resolve({}) }))
+
+    await user.click(screen.getByRole('button', { name: /Continue with Google/ }))
+
+    const forms = document.querySelectorAll('form')
+    const socialForm = Array.from(forms).find((form) => form.elements.namedItem('provider'))
+    expect((socialForm?.elements.namedItem('callback_url') as HTMLInputElement)?.value).toBe(
+      'http://test-project.test/auth/callback-complete?next=%2F'
+    )
+  })
+
+  it('passes "next" through to the login form as its post-login redirect target', async () => {
+    globalThis.fetch = vi.fn(async () =>
+      jsonResponse(200, { status: 200, data: { user: {} }, meta: { is_authenticated: true } })
+    )
+    const user = userEvent.setup()
+    render(await LoginPage({ searchParams: Promise.resolve({ next: '/dashboard' }) }))
+
+    await user.type(screen.getByLabelText('Username or email'), 'jane')
+    await user.type(screen.getByLabelText('Password'), 'correct-horse-battery')
+    await user.click(screen.getByRole('button', { name: 'Log in' }))
+
+    expect(push).toHaveBeenCalledWith('/dashboard')
+  })
+
+  it('defaults the login form\'s redirect target to "/" when no "next" is given', async () => {
+    globalThis.fetch = vi.fn(async () =>
+      jsonResponse(200, { status: 200, data: { user: {} }, meta: { is_authenticated: true } })
+    )
+    const user = userEvent.setup()
+    render(await LoginPage({ searchParams: Promise.resolve({}) }))
+
+    await user.type(screen.getByLabelText('Username or email'), 'jane')
+    await user.type(screen.getByLabelText('Password'), 'correct-horse-battery')
+    await user.click(screen.getByRole('button', { name: 'Log in' }))
+
+    expect(push).toHaveBeenCalledWith('/')
+  })
+
+  describe('on the admin host', () => {
+    it('signs in to the admin, offering no signup, and comes back to the admin from a provider', async () => {
+      request.host = 'admin.test-project.test'
+      HTMLFormElement.prototype.submit = vi.fn()
+      globalThis.fetch = vi.fn(async () => new Response(null, { status: 200 }))
+      render(await LoginPage({ searchParams: Promise.resolve({}) }))
+
+      expect(screen.getByText('Sign in to the admin')).toBeTruthy()
+      expect(screen.getByLabelText('Password')).toBeTruthy()
+      expect(screen.queryByRole('link', { name: 'Sign up' })).toBeNull()
+      expect(screen.getByRole('link', { name: 'Forgot your password?' })).toBeTruthy()
+      expect(screen.queryByText('A password signs in superusers only.')).toBeNull()
+      await userEvent.click(screen.getByRole('button', { name: /Continue with Google/ }))
+      const socialForm = Array.from(document.querySelectorAll('form')).find((form) =>
+        form.elements.namedItem('provider')
+      )
+      expect(socialForm?.getAttribute('action')).toBe('http://auth.test-project.test/v0/browser/auth/provider/redirect')
+      expect((socialForm?.elements.namedItem('callback_url') as HTMLInputElement)?.value).toBe(
+        'http://admin.test-project.test/auth/callback-complete?next=%2F'
+      )
+    })
+
+    it("still takes a superuser's password when nobody else signs in with one", async () => {
+      request.host = 'admin.test-project.test'
+      passwords.signIn = false
+      render(await LoginPage({ searchParams: Promise.resolve({}) }))
+
+      expect(screen.getByLabelText('Password')).toBeTruthy()
+      expect(screen.getByText('Or')).toBeTruthy()
+      expect(screen.getByText('A password signs in superusers only.')).toBeTruthy()
+      expect(screen.queryByRole('link', { name: 'Forgot your password?' })).toBeNull()
+    })
+  })
+})

@@ -1,0 +1,110 @@
+appId: test.testproject.mobile
+name: Signing up needs the address confirmed before the account can sign in
+---
+- runFlow: common/start.yaml
+- evalScript: ${output.handle = 'm' + Date.now()}
+- evalScript: ${output.email = output.handle + '@example.test'}
+- evalScript: ${output.phone = '+1415' + String(Math.floor(Math.random() * 1e7)).padStart(7, '0')}
+- tapOn:
+    id: signup-link
+# Whichever names this project asks for.
+- runFlow:
+    when:
+      visible:
+        id: username-input
+    commands:
+      - runFlow:
+          file: common/type.yaml
+          env:
+            FIELD: username-input
+            TEXT: ${output.handle}
+- runFlow:
+    when:
+      visible:
+        id: first-name-input
+    commands:
+      - runFlow:
+          file: common/type.yaml
+          env:
+            FIELD: first-name-input
+            TEXT: Maestro
+- runFlow:
+    when:
+      visible:
+        id: last-name-input
+    commands:
+      - runFlow:
+          file: common/type.yaml
+          env:
+            FIELD: last-name-input
+            TEXT: Tester
+- runFlow:
+    file: common/type.yaml
+    env:
+      FIELD: email-input
+      TEXT: ${output.email}
+- tapOn:
+    id: phone-input
+- inputText: ${output.phone}
+- tapOn:
+    id: password-input
+- inputText: correct-horse-battery-staple
+# Return leaves a one-line field, closing the keyboard over the button; hideKeyboard fails on iOS.
+- pressKey: Enter
+- tapOn:
+    id: signup-submit
+- runFlow: common/not-now.yaml
+# The number's code comes before the address's mail.
+- extendedWaitUntil:
+    visible:
+      id: verify-phone-form
+    timeout: 60000
+- runScript:
+    file: scripts/sms.js
+    env:
+      SMS_TO: ${output.phone}
+- runFlow:
+    file: common/type.yaml
+    env:
+      FIELD: verify-phone-code-input
+      TEXT: ${output.code}
+- pressKey: Enter
+- tapOn:
+    id: verify-phone-submit
+- extendedWaitUntil:
+    visible:
+      id: verify-phone-notice
+    timeout: 60000
+- runScript:
+    file: scripts/mail.js
+    env:
+      MAIL_TO: ${output.email}
+- launchApp:
+    stopApp: true
+- extendedWaitUntil:
+    visible:
+      id: login-form
+    timeout: 30000
+- runFlow:
+    file: common/type.yaml
+    env:
+      FIELD: email-input
+      TEXT: ${output.email}
+- tapOn:
+    id: password-input
+- inputText: correct-horse-battery-staple
+- pressKey: Enter
+- tapOn:
+    id: login-submit
+# iOS may offer to save the password over the page that follows, hiding it until the offer is gone.
+- extendedWaitUntil:
+    visible: You're logged in as ${output.email}|Not Now
+    timeout: 120000
+- runFlow: common/not-now.yaml
+- extendedWaitUntil:
+    visible: You're logged in as ${output.email}
+    timeout: 30000
+- tapOn:
+    id: logout-button
+- assertVisible:
+    id: login-form

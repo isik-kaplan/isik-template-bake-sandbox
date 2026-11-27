@@ -1,0 +1,89 @@
+"""Expired tokens are deleted on a schedule (the beat), and only expired ones."""
+
+from datetime import timedelta
+
+import pytest
+from django.core.management import call_command
+from django.utils import timezone
+from isik.django.scheduling import beat_schedule
+from oauth2_provider.models import get_access_token_model, get_grant_model, get_id_token_model, get_refresh_token_model
+
+from apps.oauth_provider import tasks
+from apps.oauth_provider.tasks import clear_expired_tokens
+
+
+AccessToken = get_access_token_model()
+
+
+def _token(application, expires):
+    return AccessToken.objects.create(
+        user=application.user, application=application, token=f"t-{expires.timestamp()}", expires=expires
+    )
+
+
+@pytest.mark.django_db
+def test_an_expired_token_goes_and_a_live_one_stays(application, logged):
+    """Both halves: a cleanup that deleted everything would sign every client out at once."""
+    dead = _token(application, timezone.now() - timedelta(days=1))
+    alive = _token(application, timezone.now() + timedelta(days=1))
+
+    clear_expired_tokens()
+
+    assert set(AccessToken.objects.values_list("pk", flat=True)) == {alive.pk}
+    assert not AccessToken.objects.filter(pk=dead.pk).exists()
+    assert [line["event"] for line in logged] == ["oauth.expired_tokens_cleared"]
+
+
+@pytest.mark.django_db
+def test_it_writes_down_how_many_it_deleted(application, logged):
+    """The number is the point of the line: nothing fails when this stops running, the tables just grow."""
+    for days in (1, 2, 3):
+        _token(application, timezone.now() - timedelta(days=days))
+    _token(application, timezone.now() + timedelta(days=1))
+
+    clear_expired_tokens()
+
+    assert [line["deleted"] for line in logged] == [3]
+
+
+def test_it_counts_every_table_clear_expired_deletes_from():
+    assert [model() for model in tasks.TABLES] == [
+        get_refresh_token_model(),
+        get_access_token_model(),
+        get_id_token_model(),
+        get_grant_model(),
+    ]
+
+
+@pytest.mark.django_db
+def test_a_sign_in_during_the_run_is_not_subtracted_from_the_deletions(application, logged, monkeypatch):
+    """Inserted inside clear_expired(), the one place between the two counts."""
+    for days in (1, 2):
+        _token(application, timezone.now() - timedelta(days=days))
+    real = tasks.clear_expired
+
+    def clearing_while_somebody_signs_in():
+        real()
+        _token(application, timezone.now() + timedelta(days=1))
+
+    monkeypatch.setattr(tasks, "clear_expired", clearing_while_somebody_signs_in)
+
+    clear_expired_tokens()
+
+    assert [line["deleted"] for line in logged] == [2]
+
+
+@pytest.mark.django_db
+def test_the_command_runs_the_same_cleanup(application):
+    dead = _token(application, timezone.now() - timedelta(days=1))
+
+    call_command("clear_expired_tokens")
+
+    assert not AccessToken.objects.filter(pk=dead.pk).exists()
+
+
+def test_the_beat_runs_it_daily():
+    entry = beat_schedule()["clear_expired_tokens"]
+
+    assert entry["task"] == clear_expired_tokens.name
+    assert (entry["schedule"].hour, entry["schedule"].minute) == ({4}, {30})

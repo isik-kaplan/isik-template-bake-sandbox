@@ -1,0 +1,110 @@
+import json
+
+import pytest
+from allauth.account.models import EmailAddress
+from allauth.socialaccount.providers import registry
+from allauth.socialaccount.providers.github.provider import GitHubProvider
+from allauth.socialaccount.providers.google.provider import GoogleProvider
+from allauth.socialaccount.providers.google.views import GoogleOAuth2Adapter
+from allauth.socialaccount.providers.openid_connect.provider import OpenIDConnectProvider
+from allauth.socialaccount.providers.openid_connect.views import OpenIDConnectOAuth2Adapter
+from django.conf import settings
+
+from apps.common.links import auth_path
+from apps.users.models.user import User
+from apps.users.names import NameRequirement
+
+
+AUTH_URLCONF = "test_project.urls.auth"
+PASSWORD = "correct-horse-battery-staple"
+OIDC_PROVIDER_ID = "test-idp"
+AUTHORIZATION_ENDPOINT = "https://idp.example.test/authorize"
+TOKEN_ENDPOINT = "https://idp.example.test/token"
+CALLBACK_URL = "https://auth.example.test/callback"
+# allauth turns away a login by an account with no number and texts one whose number is unverified.
+SIGNS_IN = {"phone": "+14155550101", "phone_verified": True}
+
+
+def signup_names(handle):
+    """What signup must be told under the generated name requirement, no more: `handle` is the username."""
+    given = {"username": handle, "first_name": handle.capitalize(), "last_name": "Tester"}
+    return {name: given[name] for name in NameRequirement.current().required}
+
+
+class Headless:
+    """allauth's headless browser API as the frontend calls it: auth host, JSON, primed CSRF token."""
+
+    def __init__(self, client):
+        self.client = client
+        self.host = f"auth.{settings.PARENT_HOST}"
+
+    @staticmethod
+    def url(name):
+        return auth_path(f"headless:browser:{name}")
+
+    def call(self, method, name, data=None):
+        self.client.get(self.url("account:current_session"), HTTP_HOST=self.host)
+        return self.client.generic(
+            method,
+            self.url(name),
+            json.dumps(data) if data is not None else "",
+            content_type="application/json",
+            HTTP_HOST=self.host,
+            HTTP_X_CSRFTOKEN=self.client.cookies["csrftoken"].value,
+        )
+
+    def prove(self, password=PASSWORD):
+        response = self.call("POST", "account:reauthenticate", {"password": password})
+        assert response.status_code == 200
+        return response
+
+
+@pytest.fixture
+def headless(client):
+    return Headless(client)
+
+
+@pytest.fixture
+def alice(db):
+    # Verified: allauth turns away a login by an account with no number, and texts one with an unverified one.
+    user = User.objects.create_user(
+        username="alice", email="alice@example.test", password=PASSWORD, phone="+14155550100", phone_verified=True
+    )
+    # Verified, so a password login through allauth signs her straight in.
+    EmailAddress.objects.create(user=user, email=user.email, verified=True, primary=True)
+    return user
+
+
+@pytest.fixture
+def signed_in(client, alice):
+    client.force_login(alice)
+    return alice
+
+
+@pytest.fixture
+def providers(settings, monkeypatch):
+    """An OIDC issuer, Google with its session age claims on, and a plain OAuth2 provider, registered by hand since
+    allauth only registers installed ones."""
+    registry.load()
+    for provider_class in (OpenIDConnectProvider, GoogleProvider, GitHubProvider):
+        monkeypatch.setitem(registry.provider_map, provider_class.id, provider_class)
+    app = {"client_id": "client", "secret": "secret", "key": ""}
+    settings.SOCIALACCOUNT_PROVIDERS = {
+        "openid_connect": {
+            "APPS": [
+                {
+                    **app,
+                    "provider_id": OIDC_PROVIDER_ID,
+                    "name": "Test IdP",
+                    "settings": {"server_url": "https://idp.example.test", "fresh_sign_in": True},
+                }
+            ]
+        },
+        "google": {"APPS": [{**app, "settings": {"fresh_sign_in": True}}]},
+        "github": {"APPS": [app]},
+    }
+    openid_config = {"authorization_endpoint": AUTHORIZATION_ENDPOINT, "token_endpoint": TOKEN_ENDPOINT}
+    monkeypatch.setattr(OpenIDConnectOAuth2Adapter, "openid_config", property(lambda self: openid_config))
+    # Their callback routes only exist where the project enables those providers itself.
+    for adapter in (OpenIDConnectOAuth2Adapter, GoogleOAuth2Adapter):
+        monkeypatch.setattr(adapter, "get_callback_url", lambda self, request, app: CALLBACK_URL)

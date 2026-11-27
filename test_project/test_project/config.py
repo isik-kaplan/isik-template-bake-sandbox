@@ -1,0 +1,134 @@
+from dotenv import load_dotenv
+from isik.common.config import boolean, comma_separated_list, config, integer, string
+
+
+load_dotenv(verbose=True, override=False)
+
+CONFIG = config(
+    {
+        "DEBUG": boolean(),
+        "SECRET_KEY": string(),
+        "CREDENTIAL_KEY": string(missing_default=""),
+        # What people are shown the product is called: mails, the authenticator app, the API docs.
+        "NAME": string(missing_default="Test Project"),
+        "DOMAIN": string(),
+        # The commit the image was built from, a build argument: many commits share a version.
+        "BUILD": string(missing_default="dev"),
+        "DB": {
+            "NAME": string(),
+            "USER": string(),
+            "PASSWORD": string(),
+            "HOST": string(),
+            "PORT": string(),
+        },
+        "BROKER": {
+            "USER": string(),
+            "PASSWORD": string(),
+            "HOST": string(),
+            "PORT": string(),
+        },
+        "CACHE": {
+            # redis or database: where rate limits count.
+            "BACKEND": string(missing_default="redis"),
+            "HOST": string(missing_default=""),
+            "PORT": string(missing_default="6379"),
+            "PASSWORD": string(missing_default=""),
+        },
+        "STORAGE": {
+            # disk (the media volume) or s3 (a bucket: the bundled Garage's, or a provider's).
+            "BACKEND": string(missing_default="s3"),
+            "BUCKET_NAME": string(missing_default=""),
+            "ENDPOINT_URL": string(missing_default=""),
+            "ACCESS_KEY_ID": string(missing_default=""),
+            "SECRET_ACCESS_KEY": string(missing_default=""),
+            "REGION_NAME": string(missing_default=""),
+            # The provider's answer: Garage takes only "path", AWS is moving new buckets to "virtual".
+            "ADDRESSING_STYLE": string(missing_default="path"),
+        },
+        "SETUP": {
+            "SUPERUSER": {
+                # Empty for no handle.
+                "USERNAME": string(missing_default=""),
+                "EMAIL": string(),
+                "PASSWORD": string(),
+                "PHONE": string(),
+            },
+        },
+        "RATE_LIMITS": {
+            # Off only in e2e, which acts far faster than any person.
+            "ENABLED": boolean(missing_default=True),
+            # DRF rates: signed out per address, signed in per account.
+            "ANONYMOUS": string(missing_default="120/minute"),
+            "USER": string(missing_default="600/minute"),
+        },
+        "OAUTH_PROVIDER": {
+            # off, approval (a superuser approves each app) or auto.
+            "MODE": string(missing_default="off"),
+            # RSA private key as PEM; a literal \n stands for a line break.
+            "SIGNING_KEY": string(missing_default=""),
+            "APPLICATIONS_PER_USER": integer(missing_default=10),
+        },
+        "SOCIAL_LOGIN": {
+            # The frontend reads the same variable. Credentials are OAUTH__<ID>__*.
+            "PROVIDERS": comma_separated_list(missing_default=[]),
+            # Nobody signs in with a password but a superuser, in the admin. The frontend reads it too.
+            "ONLY": boolean(missing_default=False),
+        },
+        "ACCOUNTS": {
+            # erase or anonymize: what deleting an account does once its grace period is over.
+            "DELETION": string(missing_default="erase"),
+            # How long a person has to change their mind, by signing back in.
+            "DELETION_AFTER_DAYS": integer(missing_default=14),
+            # What a signup asks somebody to be called: one of apps/users/names.py's NameRequirement.
+            "NAME_REQUIREMENT": string(missing_default="username_with_optional_full"),
+        },
+        "SENTRY": {
+            "DSN": string(missing_default=None),
+            "TRACES_SAMPLE_RATE": string(missing_default="0"),
+        },
+        "LOGGING": {
+            "FORMAT": string(missing_default="console"),
+            # "non-2xx", "all" or "none".
+            "REQUESTS": string(missing_default="non-2xx"),
+            # A slow request is logged whatever it answered. Zero turns that off.
+            "SLOW_REQUEST_MS": integer(missing_default=1000),
+        },
+        "EMAIL": {
+            # Only e2e sets it, forcing the provider despite DEBUG.
+            "BACKEND": string(missing_default=""),
+            "SMTP": {
+                "HOST": string(),
+                "PORT": string(),
+                "USER": string(),
+                "PASSWORD": string(),
+                "USE_TLS": boolean(missing_default=True),
+            },
+            "DEFAULT_FROM": string(),
+        },
+        "SMS": {
+            # Only e2e sets it, forcing the file sender despite DEBUG.
+            "BACKEND": string(missing_default=""),
+            # Where the file sender appends; the mobile flows' native backend can't make /sms on macOS.
+            "FILE_PATH": string(missing_default="/sms/messages.jsonl"),
+            # Empty in development, where texts go to the log; isik.E024 refuses a production start without them.
+            "TWILIO": {
+                "ACCOUNT_SID": string(missing_default=""),
+                "AUTH_TOKEN": string(missing_default=""),
+                "FROM": string(missing_default=""),
+            },
+        },
+        # Push is off until a service has credentials: see .env.example.
+        "PUSH": {
+            "APNS": {
+                "TEAM_ID": string(missing_default=""),
+                "KEY_ID": string(missing_default=""),
+                "KEY": string(missing_default=""),
+                "TOPIC": string(missing_default="test.testproject.mobile"),
+            },
+            "FCM": {
+                "CREDENTIALS": string(missing_default=""),
+            },
+        },
+    },
+    prefix="TEST_PROJECT",
+)

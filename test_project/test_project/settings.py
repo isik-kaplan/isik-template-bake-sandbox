@@ -1,0 +1,575 @@
+import os
+import sys
+from datetime import timedelta
+from pathlib import Path
+
+import sentry_sdk
+from corsheaders.defaults import default_headers
+from django.conf.locale import LANG_INFO
+from isik.django.apps.common.checks import Check, CheckOption, Severity
+from isik.django.apps.notifications.channels import Channel
+
+from apps.common.caches import configured_caches
+from apps.common.logging.scrub import scrub_event
+from apps.common.storages import configured_storage
+from apps.notifications.push import push_credentials
+from apps.oauth_provider import device_codes
+from apps.oauth_provider.mode import oauth_provider_mode
+from apps.users.deletion import deletion_backend
+from apps.users.names import NameRequirement
+from apps.users.social_login import (
+    provider_of,
+    reauthentication_methods,
+    social_account_providers,
+    social_login_only,
+    social_login_provider_ids,
+)
+
+from . import __version__
+from .config import CONFIG as config  # Django thinks CONFIG is a setting if it is all caps  # NOQA
+
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+DEBUG = config.DEBUG
+SECRET_KEY = config.SECRET_KEY
+# Not SECRET_KEY, so rotating the signing key does not cost every stored secret.
+CREDENTIAL_KEY = config.CREDENTIAL_KEY
+
+# "localhost" is only for the container-internal Docker healthcheck. admin.<domain> is the frontend's, listed so
+# allauth takes it as a place to send somebody back to after a provider.
+ALLOWED_HOSTS = [
+    config.DOMAIN,
+    f"api.{config.DOMAIN}",
+    f"admin.{config.DOMAIN}",
+    f"auth.{config.DOMAIN}",
+    "localhost",
+]
+
+
+SOCIAL_LOGIN_PROVIDER_IDS = social_login_provider_ids(config.SOCIAL_LOGIN.PROVIDERS)
+SOCIAL_LOGIN_ONLY = social_login_only(config.SOCIAL_LOGIN.ONLY, SOCIAL_LOGIN_PROVIDER_IDS, DEBUG)
+# erase or anonymize. For a backend of your own, set ISIK's DELETION_BACKEND below to its class instead.
+ACCOUNT_DELETION = config.ACCOUNTS.DELETION
+
+INSTALLED_APPS = [
+    "django_hosts",
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django.contrib.staticfiles",
+    "django.contrib.postgres",
+    "django.contrib.sites",
+    "whitenoise.runserver_nostatic",
+    "corsheaders",
+    "pgtrigger",
+    "pghistory",
+    "isik.django.apps.common",
+    "isik.django.apps.accounts",
+    # isik's mechanism; the tables are apps.notifications'.
+    "isik.django.apps.notifications",
+    "isik.django.apps.notifications.audience",
+    # isik's mechanism again; the tables are apps.features'.
+    "isik.django.apps.features",
+    "django_filters",
+    "rest_framework",
+    "drf_spectacular",
+    "allauth",
+    "allauth.account",
+    "allauth.socialaccount",
+    # Once each: several OpenID Connect issuers are one provider's apps.
+    *dict.fromkeys(f"allauth.socialaccount.providers.{provider_of(entry)}" for entry in SOCIAL_LOGIN_PROVIDER_IDS),
+    "allauth.usersessions",
+    "allauth.mfa",
+    "allauth.headless",
+    "oauth2_provider",
+    "isik.django.apps.scheduling",
+    "django_celery_results",
+    "apps.common.apps.CommonConfig",
+    "apps.core.apps.CoreConfig",
+    "apps.users.apps.UsersConfig",
+    "apps.oauth_provider.apps.OAuthProviderConfig",
+    "apps.notifications.apps.NotificationsConfig",
+    "apps.features.apps.FeaturesConfig",
+    "apps.scheduling.apps.SchedulingConfig",
+]
+
+MIDDLEWARE = [
+    # Outermost, so it measures the body last and sees answers made above CommonMiddleware.
+    "apps.common.middleware.content_length.ContentLengthMiddleware",
+    # Before django-hosts: the Docker healthcheck's Host: localhost matches no pattern.
+    "apps.common.middleware.health_check.HealthCheckMiddleware",
+    "django_hosts.middleware.HostsRequestMiddleware",
+    # Before anything that may answer early (CommonMiddleware), or the response lacks CORS headers.
+    "corsheaders.middleware.CorsMiddleware",
+    "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
+    "django.contrib.sessions.middleware.SessionMiddleware",
+    "django.middleware.common.CommonMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "allauth.account.middleware.AccountMiddleware",
+    # After AuthenticationMiddleware, which decides whether a request that sent a session cookie is signed in.
+    "isik.django.apps.common.middleware.DeadSessionCookieMiddleware",
+    # After AuthenticationMiddleware: the user's saved language beats the browser's.
+    "apps.common.middleware.language.UserLanguageMiddleware",
+    # After AuthenticationMiddleware: stamps request.user as the pghistory actor.
+    "isik.django.apps.common.middleware.HistoryContextMiddleware",
+    # Below the history context, so the actor is already on its line.
+    "apps.common.middleware.request_log.RequestLogMiddleware",
+    "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    "django_hosts.middleware.HostsResponseMiddleware",
+]
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "console": {"()": "apps.common.logging.formatters.ConsoleFormatter"},
+        "json": {"()": "apps.common.logging.formatters.JSONFormatter"},
+    },
+    "handlers": {
+        "stdout": {"class": "logging.StreamHandler", "stream": sys.stdout, "formatter": config.LOGGING.FORMAT},
+    },
+    "root": {"handlers": ["stdout"], "level": "WARNING"},
+    "loggers": {
+        "test_project": {"level": "INFO"},
+        # No propagation: lowering the logger above cannot quieten an audit record.
+        "test_project.audit": {"level": "INFO", "handlers": ["stdout"], "propagate": False},
+        "django.security": {"level": "INFO"},
+        # ERROR, not off: a 500 raised outside the request-log middleware still lands.
+        "django.request": {"level": "ERROR"},
+        # Logs every query at DEBUG.
+        "django.db.backends": {"level": "WARNING"},
+        "celery": {"level": "WARNING"},
+    },
+}
+
+# Only the fallback where no request picks a host (shell, management commands).
+ROOT_URLCONF = "test_project.urls.api"
+ROOT_HOSTCONF = "test_project.hosts"
+DEFAULT_HOST = "api"
+PARENT_HOST = config.DOMAIN
+PROJECT_NAME = config.NAME
+
+SITE_ID = 1
+
+TEMPLATES = [
+    {
+        "BACKEND": "django.template.backends.django.DjangoTemplates",
+        "DIRS": [BASE_DIR / "templates"],
+        "APP_DIRS": True,
+        "OPTIONS": {
+            "context_processors": [
+                "django.template.context_processors.debug",
+                "django.template.context_processors.request",
+                "django.contrib.auth.context_processors.auth",
+            ],
+            # allauth's email templates use blocktranslate without loading i18n.
+            "builtins": ["django.templatetags.i18n"],
+        },
+    },
+]
+
+WSGI_APPLICATION = "test_project.wsgi.application"
+
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": config.DB.NAME,
+        "USER": config.DB.USER,
+        "PASSWORD": config.DB.PASSWORD,
+        "HOST": config.DB.HOST,
+        "PORT": config.DB.PORT,
+        # Idempotency claims need a transaction to commit inside. Opt out with isik's not_atomic(reason).
+        "ATOMIC_REQUESTS": True,
+    }
+}
+
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+AUTH_PASSWORD_VALIDATORS = [
+    {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
+    {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator", "OPTIONS": {"min_length": 8}},
+    {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
+    {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
+]
+
+AUTH_USER_MODEL = "users.User"
+
+# Spelled by defining module, not the package re-export: allauth records a social login under that
+# path, and a session whose path is not listed here is anonymous from its next request.
+AUTHENTICATION_BACKENDS = [
+    "apps.users.backends.authentication.AuthenticationBackend",
+    "apps.users.backends.permissions.PermissionsBackend",
+]
+
+# What a signup asks somebody to be called.
+NAME_REQUIREMENT = NameRequirement.named(config.ACCOUNTS.NAME_REQUIREMENT)
+# allauth refuses phone as a login method unless signup requires one.
+ACCOUNT_LOGIN_METHODS = NAME_REQUIREMENT.login_methods | {"phone"}
+# The handle is listed optional under every requirement, so the API schema never changes;
+# apps.users.signup_form applies the requirement. Unlisted, allauth would drop the field.
+ACCOUNT_SIGNUP_FIELDS = ["email*", "phone*", "username", "password1*"]
+ACCOUNT_SIGNUP_FORM_CLASS = "apps.users.signup_form.SignupNames"
+# allauth's default is the handle, which somebody may not have. Shown to the person themselves and in their mail.
+ACCOUNT_USER_DISPLAY = "apps.users.names.label"
+ACCOUNT_ADAPTER = "apps.users.adapters.account.AccountAdapter"
+SOCIALACCOUNT_ADAPTER = "apps.users.adapters.social_account.SocialAccountAdapter"
+# True would commit the provider's username unconfirmed on a first social signup.
+SOCIALACCOUNT_AUTO_SIGNUP = False
+ACCOUNT_EMAIL_VERIFICATION = "mandatory"
+ACCOUNT_EMAIL_NOTIFICATIONS = True
+ACCOUNT_REAUTHENTICATION_METHODS = reauthentication_methods(SOCIAL_LOGIN_ONLY)
+# allauth spends its 1/m on every request to the phone page: its GET, and the change the reauthentication
+# gate turns back, so the change after the proof was refused. Each change still costs a fresh proof.
+ACCOUNT_RATE_LIMITS = {"change_phone": "5/m/user"}
+# Both off in allauth, which leaves a mistyped number, or a text that never arrived, an account nobody
+# can sign in to: each login texts the same number again. True allows two of each.
+ACCOUNT_PHONE_VERIFICATION_SUPPORTS_CHANGE = True
+ACCOUNT_PHONE_VERIFICATION_SUPPORTS_RESEND = True
+# False, not {}: allauth .update()s its defaults with this, so {} would disable nothing.
+if not config.RATE_LIMITS.ENABLED:  # see pyproject.toml's coverage exclude_lines for why
+    ACCOUNT_RATE_LIMITS = False
+
+# On costs a write per request; off, last_seen_at never moves.
+USERSESSIONS_TRACK_ACTIVITY = False
+
+MFA_SUPPORTED_TYPES = ["totp", "recovery_codes", "webauthn"]
+MFA_ADAPTER = "apps.users.adapters.mfa.MFAAdapter"
+# Otherwise the authenticator app shows the Site row's name, "example.com".
+MFA_TOTP_ISSUER = PROJECT_NAME
+# A passkey is a second factor here, never a replacement for the password.
+MFA_PASSKEY_LOGIN_ENABLED = False
+MFA_RECOVERY_CODES_SHOW_ONCE = True
+
+HEADLESS_ONLY = True
+HEADLESS_SERVE_SPECIFICATION = True
+# Adds "language" to the session/user payload.
+HEADLESS_ADAPTER = "apps.users.headless.HeadlessAdapter"
+
+FRONTEND_SCHEME = "http" if DEBUG else "https"
+FRONTEND_ORIGIN = f"{FRONTEND_SCHEME}://{config.DOMAIN}"
+# Backstop in case a proxy drops X-Forwarded-Proto: allauth's links stay https outside DEBUG.
+ACCOUNT_DEFAULT_HTTP_PROTOCOL = FRONTEND_SCHEME
+# Absolute: the frontend is a different origin from auth.<domain>. Concatenated, not an f-string,
+# so allauth's "{key}" placeholder survives.
+HEADLESS_FRONTEND_URLS = {
+    "account_signup": FRONTEND_ORIGIN + "/auth/signup",
+    "account_reset_password": FRONTEND_ORIGIN + "/auth/forgot-password",
+    "account_reset_password_from_key": FRONTEND_ORIGIN + "/auth/password-reset/{key}",
+    "account_confirm_email": FRONTEND_ORIGIN + "/auth/verify-email/{key}",
+    "socialaccount_login_error": FRONTEND_ORIGIN + "/auth/provider-error",
+}
+
+
+# Read from the environment, not config.py: the set of providers has no fixed schema.
+_OAUTH_PREFIX = "TEST_PROJECT__OAUTH"
+SOCIALACCOUNT_PROVIDERS = social_account_providers(SOCIAL_LOGIN_PROVIDER_IDS, os.environ, prefix=_OAUTH_PREFIX)
+
+# Its tables exist whatever the mode, so switching it on later is a restart, never a migration.
+OAUTH_PROVIDER_MODE = oauth_provider_mode(config.OAUTH_PROVIDER.MODE, config.OAUTH_PROVIDER.SIGNING_KEY)
+OAUTH_PROVIDER_APPLICATIONS_PER_USER = config.OAUTH_PROVIDER.APPLICATIONS_PER_USER
+OAUTH2_PROVIDER_APPLICATION_MODEL = "oauth_provider.Application"
+OAUTH2_PROVIDER = {
+    "OIDC_ENABLED": True,
+    "OIDC_RSA_PRIVATE_KEY": config.OAUTH_PROVIDER.SIGNING_KEY.replace("\\n", "\n"),
+    # Only for discovery; the consent page words each scope itself.
+    "SCOPES": {"openid": "Who you are", "profile": "Your name and username", "email": "Your email address"},
+    "DEFAULT_SCOPES": ["openid"],
+    "SCOPES_BACKEND_CLASS": "apps.oauth_provider.token_scopes.TokenScopes",
+    # DOT's own advertises the profile and email claims and fills in neither.
+    "OAUTH2_VALIDATOR_CLASS": "apps.oauth_provider.validators.OAuth2Validator",
+    "REQUEST_APPROVAL_PROMPT": "auto",
+    "PKCE_REQUIRED": True,
+    "ALLOWED_REDIRECT_URI_SCHEMES": ["http", "https"] if DEBUG else ["https"],
+    "REFRESH_TOKEN_REUSE_PROTECTION": True,
+    # RFC 9700, ahead of DOT 4.0 making it the default.
+    "COMPLIANT_BCP_RFC9700_IMPLICIT_GRANT": True,
+    "COMPLIANT_BCP_RFC9700_PASSWORD_GRANT": True,
+    "COMPLIANT_BCP_RFC9700_PKCE_METHOD": True,
+    "COMPLIANT_BCP_RFC9700_ACCESS_TOKEN_TRANSPORT": True,
+    "COMPLIANT_BCP_RFC9700_AUTHZ_RESPONSE_ISS": True,
+    "COMPLIANT_BCP_RFC9700_TOKEN_STORAGE": True,
+    # These make a shortfall fail check --deploy rather than warn.
+    "COMPLIANT_BCP_RFC9700_REFRESH_TOKEN": True,
+    "COMPLIANT_BCP_RFC9700_REDIRECT_URI_SCHEME": True,
+    "COMPLIANT_BCP_RFC9700_REDIRECT_URI_MATCHING": True,
+    "COMPLIANT_BCP_RFC9700_PKCE_REQUIRED": True,
+    "OAUTH_DEVICE_VERIFICATION_URI": FRONTEND_ORIGIN + "/device",
+    "OAUTH_DEVICE_VERIFICATION_URI_COMPLETE": FRONTEND_ORIGIN + "/device?code={user_code}",
+    "OAUTH_DEVICE_USER_CODE_GENERATOR": device_codes.user_code,
+    "OAUTH_PRE_TOKEN_VALIDATION": [device_codes.spend_device_code],
+}
+# Absolute: DOT's authorize endpoint is on auth.<domain>, the sign-in page on the frontend.
+LOGIN_URL = FRONTEND_ORIGIN + "/auth/login"
+
+LANGUAGE_CODE = "en"
+LANGUAGES = [
+    (code, LANG_INFO[code]["name"])
+    for code in [
+        "en",
+        "tr",
+    ]
+]
+LOCALE_PATHS = [BASE_DIR / "locale"]
+TIME_ZONE = "UTC"
+USE_I18N = True
+USE_TZ = True
+
+STATIC_URL = "/static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"
+# Not the Manifest variant: it needs collectstatic before any page with static files renders, tests included.
+STORAGES = {
+    "default": configured_storage(
+        config.STORAGE.BACKEND,
+        bucket_name=config.STORAGE.BUCKET_NAME,
+        endpoint_url=config.STORAGE.ENDPOINT_URL,
+        access_key_id=config.STORAGE.ACCESS_KEY_ID,
+        secret_access_key=config.STORAGE.SECRET_ACCESS_KEY,
+        region_name=config.STORAGE.REGION_NAME,
+        addressing_style=config.STORAGE.ADDRESSING_STYLE,
+    ),
+    "staticfiles": {
+        "BACKEND": "whitenoise.storage.CompressedStaticFilesStorage",
+    },
+}
+
+# nginx always sets this header.
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+SESSION_SERIALIZER = "django_msgspec.sessions.JSONSerializer"
+SESSION_COOKIE_SECURE = not DEBUG
+CSRF_COOKIE_SECURE = not DEBUG
+# Preload stays off: leaving the browsers' list takes months, so it is the owner's call.
+SECURE_HSTS_SECONDS = 0 if DEBUG else 31_536_000
+SECURE_HSTS_INCLUDE_SUBDOMAINS = not DEBUG
+# W008: nginx or the load balancer redirects to https. W021: preload, as above.
+SILENCED_SYSTEM_CHECKS = ["security.W008", "security.W021"]
+# One session/CSRF cookie pair across every subdomain.
+SESSION_COOKIE_DOMAIN = f".{config.DOMAIN}"
+CSRF_COOKIE_DOMAIN = f".{config.DOMAIN}"
+
+
+def _origins(hosts: list[str], debug: bool) -> list[str]:
+    """Under DEBUG https too, for scripts/dev-tls.sh and the e2e stack."""
+    schemes = ["http", "https"] if debug else ["https"]
+    return [f"{scheme}://{host}" for host in hosts for scheme in schemes]
+
+
+CSRF_TRUSTED_ORIGINS = _origins(
+    [config.DOMAIN, f"api.{config.DOMAIN}", f"admin.{config.DOMAIN}", f"auth.{config.DOMAIN}"], DEBUG
+)
+# The frontend's JS calls api./auth.<domain> directly - same site, but a different origin. admin.<domain> is
+# the frontend too, serving the admin.
+CORS_ALLOWED_ORIGINS = _origins([config.DOMAIN, f"admin.{config.DOMAIN}"], DEBUG)
+CORS_ALLOW_CREDENTIALS = True
+# Response headers the frontend reads; cross-origin JS sees no custom header unless named here.
+CORS_EXPOSE_HEADERS = ["X-Reauthentication-Required", "X-Session-Cleared", "ETag", "X-Request-ID"]
+# A custom request header not listed here is refused at the preflight.
+CORS_ALLOW_HEADERS = (*default_headers, "idempotency-key", "if-match", "if-none-match")
+
+# Rate limits count here, so it must be shared: a per-process cache multiplies every limit.
+CACHES = configured_caches(config.CACHE.BACKEND, config.CACHE.HOST, config.CACHE.PORT, config.CACHE.PASSWORD)
+
+THROTTLE_CLASSES = [
+    "apps.common.api.throttling.AnonymousRateThrottle",
+    "apps.common.api.throttling.UserRateThrottle",
+    "apps.common.api.throttling.ScopedRateThrottle",
+]
+
+REST_FRAMEWORK = {
+    "DEFAULT_THROTTLE_CLASSES": THROTTLE_CLASSES if config.RATE_LIMITS.ENABLED else [],
+    "DEFAULT_THROTTLE_RATES": {
+        "anon": config.RATE_LIMITS.ANONYMOUS,
+        "user": config.RATE_LIMITS.USER,
+        # A device's user code is short enough to guess at.
+        "device_codes": "10/minute",
+    },
+    "PAGE_SIZE": 100,
+    "DEFAULT_PAGINATION_CLASS": "isik.django.drf.pagination.PageNumberPagination",
+    "DEFAULT_FILTER_BACKENDS": [
+        "django_filters.rest_framework.DjangoFilterBackend",
+        "rest_framework.filters.SearchFilter",
+        "rest_framework.filters.OrderingFilter",
+    ],
+    # isik's own, for HistoryMixin's colliding operation ids and untyped paginated lists.
+    "DEFAULT_SCHEMA_CLASS": "isik.django.drf.spectacular.AutoSchema",
+    "DEFAULT_PERMISSION_CLASSES": [
+        "isik.django.drf.permissions.ReadOnly",
+    ],
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework.authentication.SessionAuthentication",
+        # The token is the session key, for non-browser clients - not a second auth system.
+        "allauth.headless.contrib.rest_framework.authentication.XSessionTokenAuthentication",
+        # After the session ones, whose answer to nobody signed in (403) is the one DRF gives.
+        "apps.users.authentication.PersonalAccessTokenAuthentication",
+        "apps.oauth_provider.authentication.ApplicationTokenAuthentication",
+    ],
+    "EXCEPTION_HANDLER": "apps.common.api.exception_handler.exception_handler",
+    "DEFAULT_RENDERER_CLASSES": ("apps.common.api.renderers.JSONRenderer",),
+    # JSON alone would answer 415 to multipart.
+    "DEFAULT_PARSER_CLASSES": (
+        "django_msgspec.rest_framework.JSONParser",
+        "rest_framework.parsers.FormParser",
+        "rest_framework.parsers.MultiPartParser",
+    ),
+}
+
+PUSH_CREDENTIALS = push_credentials(
+    apns_team_id=config.PUSH.APNS.TEAM_ID,
+    apns_key_id=config.PUSH.APNS.KEY_ID,
+    apns_key=config.PUSH.APNS.KEY,
+    apns_topic=config.PUSH.APNS.TOPIC,
+    fcm_credentials=config.PUSH.FCM.CREDENTIALS,
+)
+SMS_SENDERS = {
+    "console": {"BACKEND": "isik.django.sms.backends.console.SMSBackend"},
+    # e2e reads codes from this file, on a volume its browser container shares.
+    "file": {
+        "BACKEND": "isik.django.sms.backends.filebased.SMSBackend",
+        "OPTIONS": {"file_path": config.SMS.FILE_PATH},
+    },
+    "twilio": {
+        "BACKEND": "isik.django.sms.backends.twilio.SMSBackend",
+        "OPTIONS": {
+            "account_sid": config.SMS.TWILIO.ACCOUNT_SID,
+            "auth_token": config.SMS.TWILIO.AUTH_TOKEN,
+            "from_": config.SMS.TWILIO.FROM,
+        },
+    },
+}
+if config.SMS.BACKEND == "file":  # see pyproject.toml's coverage exclude_lines for why
+    # isik warns of a sender that reaches no phone with DEBUG off; e2e's is meant to.
+    SILENCED_SYSTEM_CHECKS = [*SILENCED_SYSTEM_CHECKS, "isik.W010"]
+ISIK = {
+    "DJANGO": {
+        # Time-ordered ids: rows made later sort later, which keeps index pages filling in order.
+        "PRIMARY_KEY": "isik.django.apps.common.db.models.uuid7",
+        # The served document in one language, like the generated one: a caller's Accept-Language would
+        # otherwise get it a document the committed clients do not match.
+        "SCHEMA_LANGUAGE": LANGUAGE_CODE,
+        # Each row says which build wrote it.
+        "HISTORY": {
+            # request_id is this request's own; correlation_id is nginx's, shared by what one page load caused.
+            "CONTEXT_KEYS": ("version", "build", "request_id", "correlation_id"),
+            # nginx hands it back on every response, and its add_header appends: a second setter sends it twice.
+            "RETURN_REQUEST_ID": False,
+            "CONTEXT_VERSION": __version__,
+            "CONTEXT_BUILD": config.BUILD,
+        },
+        # The web app watches for this header to sign a tab out once the backend has dropped a dead session cookie.
+        "SESSIONS": {"DEAD_SESSION_HEADER": "X-Session-Cleared"},
+        "IDEMPOTENCY": {"CLAIM_MODEL": "common.IdempotencyClaim"},
+        # SMS__BACKEND overrides DEBUG's choice, as EMAIL__BACKEND does; a test run makes it isik's outbox.
+        "SMS": {
+            "default": SMS_SENDERS.get(config.SMS.BACKEND, SMS_SENDERS["console" if DEBUG else "twilio"]),
+        },
+        "CHECKS": {
+            # So the next model added names its own table and indexes too.
+            Check.DECLARED_NAMES: {CheckOption.ENABLED: True},
+            # A warning in isik, since a project may mean it; here ATOMIC_REQUESTS is what idempotency counts on.
+            Check.NOT_ATOMIC: {CheckOption.SEVERITY: Severity.ERROR},
+        },
+        "NOTIFICATIONS": {
+            "KIND_POLICY_MODEL": "notifications.NoticeKindPolicy",
+            "NOTICE_MODEL": "notifications.Notice",
+            "FAN_OUT_SHARD_MODEL": "notifications.FanOutShard",
+            "DELIVERY_MODEL": "notifications.Delivery",
+            "WEBHOOK_DELIVERY_MODEL": "notifications.WebhookDelivery",
+            "EMAIL_DELIVERY_MODEL": "notifications.EmailDelivery",
+            "INBOX_DELIVERY_MODEL": "notifications.InboxDelivery",
+            "DELIVERY_ATTEMPT_MODEL": "notifications.DeliveryAttempt",
+            "SUBSCRIPTION_MODEL": "notifications.Subscription",
+            "INBOX_ITEM_MODEL": "notifications.InboxItem",
+            "ENDPOINT_MODEL": "notifications.Endpoint",
+            "ENDPOINT_KIND_MODEL": "notifications.EndpointKind",
+            "DEVICE_MODEL": "notifications.Device",
+            "PUSH_DELIVERY_MODEL": "notifications.PushDelivery",
+            # Every kind is declared in apps/notifications/kinds.py, so a name can't be invented at a call site.
+            "REQUIRE_DECLARED_KINDS": True,
+            "CHANNELS": (Channel.INBOX, Channel.EMAIL, Channel.WEBHOOK, *((Channel.PUSH,) if PUSH_CREDENTIALS else ())),
+            # Names the signature header receivers verify, so it's the slug: renaming the product mustn't move it.
+            "PROJECT_NAME": "test-project",
+            # A user's endpoint is sent only notices meant for them.
+            "ENDPOINT_OWNER_FIELD": "owner",
+            "EMAIL_SENDER": "isik.django.apps.notifications.channels.email.send_from_mjml_templates",
+            "EMAIL_CONTEXT": "apps.common.email.notice_email_context",
+            "RECIPIENT_LANGUAGE": "apps.common.language.saved_language",
+            "PUSH": PUSH_CREDENTIALS,
+            "SUBSCRIPTION_FORCED_KIND": "notification_settings_forced",
+            "KINDS_VISIBLE": "apps.notifications.visible_kinds.visible_kinds",
+        },
+        "ACCOUNTS": {
+            "DELETION_AFTER": timedelta(days=config.ACCOUNTS.DELETION_AFTER_DAYS),
+            "DELETION_BACKEND": deletion_backend(ACCOUNT_DELETION),
+            # Which of a person's rows go and which stay, model by model.
+            "ERASURES": "apps.users.erasures",
+        },
+        "FEATURES": {
+            "FEATURE_MODEL": "features.Feature",
+            "GRANT_MODEL": "features.FeatureGrant",
+            "SWEEP_MODEL": "features.SweepCursor",
+            "OVERRIDES_MODEL": "features.UserOverrides",
+            "SETTINGS": "apps.features.declarations",
+            # A grant's source: given by staff, or a trial with an end.
+            "GRANT_SOURCES": ("staff", "trial"),
+            # One run at the next boundary, rather than a minute's tick that almost always finds nothing.
+            "SWEEP": "next_boundary",
+        },
+        "SCHEDULING": {
+            "TASKS": "apps.scheduling.declarations",
+            "TASK_MODEL": "scheduling.ScheduledTaskState",
+        },
+    },
+}
+
+SPECTACULAR_SETTINGS = {
+    "TITLE": f"{PROJECT_NAME} API",
+    "DESCRIPTION": "A test project generated for template validation.",
+    "VERSION": __version__,
+    "COMPONENT_SPLIT_REQUEST": True,
+    # A nullable choice is its enum or null, not a separate NullEnum every client has to name.
+    "ENUM_ADD_EXPLICIT_BLANK_NULL_CHOICE": False,
+    "POSTPROCESSING_HOOKS": [
+        "drf_spectacular.hooks.postprocess_schema_enums",
+    ],
+    "SERVE_INCLUDE_SCHEMA": False,
+    # Filled at startup by apps.common.enum_names.
+    "ENUM_SUFFIX": "",
+    "ENUM_NAME_OVERRIDES": {},
+    # Labels differ per project; the values are the contract.
+    "ENUM_GENERATE_CHOICE_DESCRIPTION": False,
+}
+# RabbitMQ's guest user is loopback-only, so real credentials are needed even locally.
+CELERY_BROKER_URL = f"amqp://{config.BROKER.USER}:{config.BROKER.PASSWORD}@{config.BROKER.HOST}:{config.BROKER.PORT}//"
+CELERY_RESULT_BACKEND = "django-db"
+# isik's: the declarations in apps/scheduling are beat's schedule, and staff pause or run them from the admin.
+CELERY_BEAT_SCHEDULER = "isik.django.apps.scheduling.scheduler:Scheduler"
+# How soon what staff change reaches beat, which reads their rows again this often.
+CELERY_BEAT_MAX_LOOP_INTERVAL = 30
+
+# EMAIL__BACKEND overrides DEBUG's choice: e2e needs the provider but DEBUG=false would force secure cookies.
+EMAIL_PROVIDER = "django.core.mail.backends.smtp.EmailBackend"
+EMAIL_BACKEND = {
+    "console": "django.core.mail.backends.console.EmailBackend",
+    "smtp": EMAIL_PROVIDER,
+}.get(config.EMAIL.BACKEND, "django.core.mail.backends.console.EmailBackend" if DEBUG else EMAIL_PROVIDER)
+EMAIL_HOST = config.EMAIL.SMTP.HOST
+EMAIL_PORT = config.EMAIL.SMTP.PORT
+EMAIL_HOST_USER = config.EMAIL.SMTP.USER
+EMAIL_HOST_PASSWORD = config.EMAIL.SMTP.PASSWORD
+EMAIL_USE_TLS = config.EMAIL.SMTP.USE_TLS
+# Without one a mail host that drops packets holds the worker forever.
+EMAIL_TIMEOUT = 10
+DEFAULT_FROM_EMAIL = config.EMAIL.DEFAULT_FROM
+
+if config.SENTRY.DSN:  # see pyproject.toml's coverage exclude_lines for why
+    sentry_sdk.init(
+        dsn=config.SENTRY.DSN,
+        traces_sample_rate=float(config.SENTRY.TRACES_SAMPLE_RATE),
+        debug=DEBUG,
+        send_default_pii=False,
+        # Both halves: many commits share a version.
+        release=f"{__version__}+{config.BUILD}",
+        before_send=scrub_event,
+    )

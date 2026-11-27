@@ -1,0 +1,21 @@
+import os
+import subprocess
+import sys
+
+
+def test_every_task_beat_sends_is_one_a_fresh_worker_knows():
+    """In an interpreter of its own: here the tests have imported every task module already, registering them."""
+    script = (
+        "import django; django.setup(); "
+        "from test_project.celery import app; app.loader.import_default_modules(); "
+        "from isik.django.scheduling import beat_schedule, uses_isiks_scheduler; "
+        "entries = beat_schedule() if uses_isiks_scheduler(app.conf) else app.conf.beat_schedule or {}; "
+        "sent = {entry['task'] for entry in entries.values()}; "
+        "print(len(sent), sorted(sent - set(app.tasks)))"
+    )
+
+    result = subprocess.run([sys.executable, "-c", script], env=os.environ, capture_output=True, text=True, check=True)
+
+    scheduled, unknown = result.stdout.splitlines()[-1].split(" ", 1)
+    assert unknown == "[]"
+    assert int(scheduled) > 0

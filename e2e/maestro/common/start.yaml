@@ -1,0 +1,21 @@
+appId: test.testproject.mobile
+---
+# iOS keeps the keychain through clearState, so a session an earlier flow left behind is logged out here.
+- launchApp:
+    clearState: true
+- extendedWaitUntil:
+    visible:
+      id: login-form|home-heading
+    # The first session check can wait on a busy backend well past half a minute.
+    timeout: 90000
+- runFlow:
+    when:
+      visible:
+        id: logout-button
+    commands:
+      - tapOn:
+          id: logout-button
+- extendedWaitUntil:
+    visible:
+      id: login-form
+    timeout: 60000

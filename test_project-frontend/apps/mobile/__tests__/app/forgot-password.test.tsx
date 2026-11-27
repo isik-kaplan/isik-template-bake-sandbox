@@ -1,0 +1,122 @@
+import ForgotPassword from '@/app/forgot-password'
+import { look, themeOf } from '@/theme'
+
+import { fireEvent, render, screen, waitFor } from '@testing-library/react-native'
+
+const LIGHT = themeOf('light')
+
+const mockRequestPasswordReset = jest.fn()
+jest.mock('@/lib/session', () => ({
+  getAuthApi: () => ({ requestPasswordReset: (...args: unknown[]) => mockRequestPasswordReset(...args) }),
+}))
+
+jest.mock('expo-router', () => {
+  const { Text } = jest.requireActual('react-native')
+  return {
+    Link: ({ children, testID }: { children: unknown; testID?: string }) => <Text testID={testID}>{children}</Text>,
+    Redirect: ({ href }: { href: string }) => <Text testID="redirect">{href}</Text>,
+  }
+})
+
+describe('ForgotPassword', () => {
+  beforeEach(() => jest.clearAllMocks())
+
+  it('shows the idle "Send reset link" label before any submission', async () => {
+    await render(<ForgotPassword />)
+    expect(screen.getByTestId('forgot-password-submit-label').props.children).toBe('Send reset link')
+  })
+
+  it('starts with an empty email field', async () => {
+    await render(<ForgotPassword />)
+    expect(screen.getByTestId('email-input').props.value).toBe('')
+  })
+
+  it('shows the heading and input placeholder', async () => {
+    await render(<ForgotPassword />)
+    expect(screen.getByTestId('forgot-password-heading').props.children).toBe('Forgot password')
+    expect(screen.getByTestId('email-input').props.placeholder).toBe('Email')
+  })
+
+  it('requests a password reset for the entered email and shows the confirmation', async () => {
+    mockRequestPasswordReset.mockResolvedValue({ data: undefined, error: undefined })
+    await render(<ForgotPassword />)
+    await fireEvent.changeText(screen.getByTestId('email-input'), 'jane@test.test')
+    await fireEvent.press(screen.getByTestId('forgot-password-submit'))
+    await waitFor(() => expect(screen.getByTestId('forgot-password-sent')).toBeTruthy())
+    expect(mockRequestPasswordReset).toHaveBeenCalledWith('jane@test.test')
+    expect(screen.getByTestId('forgot-password-heading').props.children).toBe('Check your email')
+    expect(screen.getByTestId('forgot-password-sent-message').props.children).toBe(
+      "If an account exists for jane@test.test, we've sent a link to reset the password."
+    )
+  })
+
+  it('shows the confirmation even when the request errors, revealing nothing about the address', async () => {
+    mockRequestPasswordReset.mockResolvedValue({ data: undefined, error: {} })
+    await render(<ForgotPassword />)
+    await fireEvent.press(screen.getByTestId('forgot-password-submit'))
+    await waitFor(() => expect(screen.getByTestId('forgot-password-sent')).toBeTruthy())
+  })
+
+  it('shows a submitting state while the request is in flight', async () => {
+    let resolveRequest: (value: unknown) => void = () => undefined
+    mockRequestPasswordReset.mockReturnValue(new Promise((resolve) => (resolveRequest = resolve)))
+    await render(<ForgotPassword />)
+    // Not awaited: fireEvent's act() would wait on the never-resolving promise.
+    fireEvent.press(screen.getByTestId('forgot-password-submit'))
+    await waitFor(() => expect(screen.getByText('Sending…')).toBeTruthy())
+    resolveRequest({ data: undefined, error: undefined })
+    await waitFor(() => expect(screen.getByTestId('forgot-password-sent')).toBeTruthy())
+  })
+
+  it('styles the form container', async () => {
+    await render(<ForgotPassword />)
+    expect(screen.getByTestId('forgot-password-form').props.contentContainerStyle).toEqual(look.screen())
+  })
+
+  it('styles the heading', async () => {
+    await render(<ForgotPassword />)
+    expect(screen.getByTestId('forgot-password-heading').props.style).toEqual(look.heading(LIGHT))
+  })
+
+  it('styles the submit button and its label', async () => {
+    await render(<ForgotPassword />)
+    expect(screen.getByTestId('forgot-password-submit').props.style).toEqual(look.button(LIGHT))
+    expect(screen.getByTestId('forgot-password-submit-label').props.style).toEqual(look.buttonLabel(LIGHT))
+  })
+
+  it('styles the email input', async () => {
+    await render(<ForgotPassword />)
+    expect(screen.getByTestId('email-input').props.style).toEqual(look.field(LIGHT))
+  })
+
+  it('links back to login from the form', async () => {
+    await render(<ForgotPassword />)
+    expect(screen.getByTestId('login-link')).toBeTruthy()
+    expect(screen.getByText('Back to log in')).toBeTruthy()
+  })
+
+  it('links back to login from the confirmation', async () => {
+    mockRequestPasswordReset.mockResolvedValue({ data: undefined, error: undefined })
+    await render(<ForgotPassword />)
+    await fireEvent.press(screen.getByTestId('forgot-password-submit'))
+    await waitFor(() => expect(screen.getByTestId('forgot-password-sent')).toBeTruthy())
+    expect(screen.getByTestId('login-link')).toBeTruthy()
+    expect(screen.getByText('Back to log in')).toBeTruthy()
+  })
+})
+
+describe('ForgotPassword without passwords', () => {
+  beforeEach(() => {
+    process.env.EXPO_PUBLIC_SOCIAL_LOGIN_ONLY = 'true'
+  })
+  afterEach(() => {
+    process.env.EXPO_PUBLIC_SOCIAL_LOGIN_ONLY = 'false'
+  })
+
+  it('sends anybody who reaches it back to log in', async () => {
+    await render(<ForgotPassword />)
+
+    expect(screen.getByTestId('redirect').props.children).toBe('/login')
+    expect(screen.queryByTestId('forgot-password-form')).toBeNull()
+  })
+})
